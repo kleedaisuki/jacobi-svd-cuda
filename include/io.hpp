@@ -4,6 +4,7 @@
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -49,94 +50,24 @@ namespace jacobi::svd::io
     };
 
     /**
-     * @brief 矩阵读取 policy 概念；Concept for matrix reading policy.
-     * @tparam Policy policy 类型；Policy type.
+     * @brief *.mat 读取器前置声明；Forward declaration of *.mat reader.
      */
-    template <typename Policy>
-    concept MatrixReadPolicy = requires(const std::filesystem::path &path)
-    {
-        {
-            Policy::read(path)
-        } -> std::same_as<std::vector<Matrix>>;
-    };
+    class MatReader;
 
     /**
-     * @brief 矩阵写入 policy 概念；Concept for matrix writing policy.
-     * @tparam Policy policy 类型；Policy type.
+     * @brief *.mat 写入器前置声明；Forward declaration of *.mat writer.
      */
-    template <typename Policy>
-    concept MatrixWritePolicy = requires(const std::filesystem::path &path, std::span<const Matrix> matrices)
-    {
-        {
-            Policy::write(path, matrices)
-        } -> std::same_as<void>;
-    };
+    class MatWriter;
 
     /**
-     * @brief 矩阵输入流模板；Matrix input stream template.
-     * @tparam Policy 读取 policy；Read policy.
+     * @brief *.txt 读取器前置声明；Forward declaration of *.txt reader.
      */
-    template <MatrixReadPolicy Policy>
-    class MatrixInputStream final
-    {
-    public:
-        /**
-         * @brief 构造输入流；Construct input stream.
-         * @param path 文件路径；File path.
-         */
-        explicit MatrixInputStream(std::filesystem::path path)
-            : path_(std::move(path))
-        {
-        }
-
-        /**
-         * @brief 读取全部矩阵；Read all matrices.
-         * @return 矩阵序列；Matrix sequence.
-         */
-        [[nodiscard]] std::vector<Matrix> read_all() const
-        {
-            return Policy::read(path_);
-        }
-
-    private:
-        /**
-         * @brief 文件路径；File path.
-         */
-        std::filesystem::path path_;
-    };
+    class TxtReader;
 
     /**
-     * @brief 矩阵输出流模板；Matrix output stream template.
-     * @tparam Policy 写入 policy；Write policy.
+     * @brief *.txt 写入器前置声明；Forward declaration of *.txt writer.
      */
-    template <MatrixWritePolicy Policy>
-    class MatrixOutputStream final
-    {
-    public:
-        /**
-         * @brief 构造输出流；Construct output stream.
-         * @param path 文件路径；File path.
-         */
-        explicit MatrixOutputStream(std::filesystem::path path)
-            : path_(std::move(path))
-        {
-        }
-
-        /**
-         * @brief 写入全部矩阵；Write all matrices.
-         * @param matrices 待写入矩阵序列；Matrix sequence to write.
-         */
-        void write_all(std::span<const Matrix> matrices) const
-        {
-            Policy::write(path_, matrices);
-        }
-
-    private:
-        /**
-         * @brief 文件路径；File path.
-         */
-        std::filesystem::path path_;
-    };
+    class TxtWriter;
 
     /**
      * @brief *.mat 文件 policy；Policy for *.mat files.
@@ -144,14 +75,59 @@ namespace jacobi::svd::io
     struct MatFilePolicy final
     {
         /**
-         * @brief 从 *.mat 读取矩阵流；Read matrix stream from *.mat.
+         * @brief 输入状态类型；Input state type.
+         */
+        using Reader = MatReader;
+
+        /**
+         * @brief 输出状态类型；Output state type.
+         */
+        using Writer = MatWriter;
+
+        /**
+         * @brief 打开 *.mat 读取器；Open *.mat reader.
+         * @param path 输入路径；Input path.
+         * @return 读取器对象；Reader object.
+         */
+        [[nodiscard]] static Reader open_reader(const std::filesystem::path &path);
+
+        /**
+         * @brief 打开 *.mat 写入器；Open *.mat writer.
+         * @param path 输出路径；Output path.
+         * @return 写入器对象；Writer object.
+         */
+        [[nodiscard]] static Writer open_writer(const std::filesystem::path &path);
+
+        /**
+         * @brief 读取下一张矩阵；Read next matrix.
+         * @param reader 读取器；Reader.
+         * @param matrix 输出矩阵；Output matrix.
+         * @return 成功读取返回 true，EOF 返回 false；Returns true if one matrix is read, false on EOF.
+         */
+        [[nodiscard]] static bool read_next(Reader &reader, Matrix &matrix);
+
+        /**
+         * @brief 写入下一张矩阵；Write next matrix.
+         * @param writer 写入器；Writer.
+         * @param matrix 输入矩阵；Input matrix.
+         */
+        static void write_next(Writer &writer, const Matrix &matrix);
+
+        /**
+         * @brief 刷新写入缓冲；Flush output state.
+         * @param writer 写入器；Writer.
+         */
+        static void flush(Writer &writer);
+
+        /**
+         * @brief 批量读取（兼容接口）；Bulk read (compatibility API).
          * @param path 输入路径；Input path.
          * @return 矩阵序列；Matrix sequence.
          */
         [[nodiscard]] static std::vector<Matrix> read(const std::filesystem::path &path);
 
         /**
-         * @brief 将矩阵流写入 *.mat；Write matrix stream to *.mat.
+         * @brief 批量写入（兼容接口）；Bulk write (compatibility API).
          * @param path 输出路径；Output path.
          * @param matrices 矩阵序列；Matrix sequence.
          */
@@ -160,23 +136,492 @@ namespace jacobi::svd::io
 
     /**
      * @brief 文本矩阵文件 policy；Policy for text matrix files.
-     * @note 行内以空格分隔，行间以换行分隔，矩阵之间以空行分隔；Values are space-separated, rows are newline-separated, matrices are separated by blank lines.
+     * @note 行内空格分隔，行间换行分隔，矩阵之间空行分隔；Values are space-separated, rows are newline-separated, matrices are separated by blank lines.
      */
     struct TxtFilePolicy final
     {
         /**
-         * @brief 从文本读取矩阵流；Read matrix stream from text.
+         * @brief 输入状态类型；Input state type.
+         */
+        using Reader = TxtReader;
+
+        /**
+         * @brief 输出状态类型；Output state type.
+         */
+        using Writer = TxtWriter;
+
+        /**
+         * @brief 打开文本读取器；Open text reader.
+         * @param path 输入路径；Input path.
+         * @return 读取器对象；Reader object.
+         */
+        [[nodiscard]] static Reader open_reader(const std::filesystem::path &path);
+
+        /**
+         * @brief 打开文本写入器；Open text writer.
+         * @param path 输出路径；Output path.
+         * @return 写入器对象；Writer object.
+         */
+        [[nodiscard]] static Writer open_writer(const std::filesystem::path &path);
+
+        /**
+         * @brief 读取下一张矩阵；Read next matrix.
+         * @param reader 读取器；Reader.
+         * @param matrix 输出矩阵；Output matrix.
+         * @return 成功读取返回 true，EOF 返回 false；Returns true if one matrix is read, false on EOF.
+         */
+        [[nodiscard]] static bool read_next(Reader &reader, Matrix &matrix);
+
+        /**
+         * @brief 写入下一张矩阵；Write next matrix.
+         * @param writer 写入器；Writer.
+         * @param matrix 输入矩阵；Input matrix.
+         */
+        static void write_next(Writer &writer, const Matrix &matrix);
+
+        /**
+         * @brief 刷新写入缓冲；Flush output state.
+         * @param writer 写入器；Writer.
+         */
+        static void flush(Writer &writer);
+
+        /**
+         * @brief 批量读取（兼容接口）；Bulk read (compatibility API).
          * @param path 输入路径；Input path.
          * @return 矩阵序列；Matrix sequence.
          */
         [[nodiscard]] static std::vector<Matrix> read(const std::filesystem::path &path);
 
         /**
-         * @brief 将矩阵流写入文本；Write matrix stream to text.
+         * @brief 批量写入（兼容接口）；Bulk write (compatibility API).
          * @param path 输出路径；Output path.
          * @param matrices 矩阵序列；Matrix sequence.
          */
         static void write(const std::filesystem::path &path, std::span<const Matrix> matrices);
+    };
+
+    /**
+     * @brief *.mat 读取器实现包装；Implementation wrapper of *.mat reader.
+     */
+    class MatReader final
+    {
+    public:
+        /**
+         * @brief 通过路径构造读取器；Construct reader from path.
+         * @param path 输入路径；Input path.
+         */
+        explicit MatReader(const std::filesystem::path &path);
+
+        /**
+         * @brief 析构读取器；Destroy reader.
+         */
+        ~MatReader();
+
+        /**
+         * @brief 禁止拷贝构造；Copy constructor is disabled.
+         */
+        MatReader(const MatReader &) = delete;
+
+        /**
+         * @brief 禁止拷贝赋值；Copy assignment is disabled.
+         * @return 当前对象引用；Reference to current object.
+         */
+        MatReader &operator=(const MatReader &) = delete;
+
+        /**
+         * @brief 移动构造；Move constructor.
+         * @param other 源对象；Source object.
+         */
+        MatReader(MatReader &&other) noexcept;
+
+        /**
+         * @brief 移动赋值；Move assignment.
+         * @param other 源对象；Source object.
+         * @return 当前对象引用；Reference to current object.
+         */
+        MatReader &operator=(MatReader &&other) noexcept;
+
+    private:
+        /**
+         * @brief 实现体前置声明；Forward declaration of implementation.
+         */
+        struct Impl;
+
+        /**
+         * @brief 唯一实现体指针；Unique pointer of implementation.
+         */
+        std::unique_ptr<Impl> impl_;
+
+        /**
+         * @brief 授权 policy 访问实现体；Grant policy access to implementation.
+         */
+        friend struct MatFilePolicy;
+    };
+
+    /**
+     * @brief *.mat 写入器实现包装；Implementation wrapper of *.mat writer.
+     */
+    class MatWriter final
+    {
+    public:
+        /**
+         * @brief 通过路径构造写入器；Construct writer from path.
+         * @param path 输出路径；Output path.
+         */
+        explicit MatWriter(const std::filesystem::path &path);
+
+        /**
+         * @brief 析构写入器；Destroy writer.
+         */
+        ~MatWriter();
+
+        /**
+         * @brief 禁止拷贝构造；Copy constructor is disabled.
+         */
+        MatWriter(const MatWriter &) = delete;
+
+        /**
+         * @brief 禁止拷贝赋值；Copy assignment is disabled.
+         * @return 当前对象引用；Reference to current object.
+         */
+        MatWriter &operator=(const MatWriter &) = delete;
+
+        /**
+         * @brief 移动构造；Move constructor.
+         * @param other 源对象；Source object.
+         */
+        MatWriter(MatWriter &&other) noexcept;
+
+        /**
+         * @brief 移动赋值；Move assignment.
+         * @param other 源对象；Source object.
+         * @return 当前对象引用；Reference to current object.
+         */
+        MatWriter &operator=(MatWriter &&other) noexcept;
+
+    private:
+        /**
+         * @brief 实现体前置声明；Forward declaration of implementation.
+         */
+        struct Impl;
+
+        /**
+         * @brief 唯一实现体指针；Unique pointer of implementation.
+         */
+        std::unique_ptr<Impl> impl_;
+
+        /**
+         * @brief 授权 policy 访问实现体；Grant policy access to implementation.
+         */
+        friend struct MatFilePolicy;
+    };
+
+    /**
+     * @brief *.txt 读取器实现包装；Implementation wrapper of *.txt reader.
+     */
+    class TxtReader final
+    {
+    public:
+        /**
+         * @brief 通过路径构造读取器；Construct reader from path.
+         * @param path 输入路径；Input path.
+         */
+        explicit TxtReader(const std::filesystem::path &path);
+
+        /**
+         * @brief 析构读取器；Destroy reader.
+         */
+        ~TxtReader();
+
+        /**
+         * @brief 禁止拷贝构造；Copy constructor is disabled.
+         */
+        TxtReader(const TxtReader &) = delete;
+
+        /**
+         * @brief 禁止拷贝赋值；Copy assignment is disabled.
+         * @return 当前对象引用；Reference to current object.
+         */
+        TxtReader &operator=(const TxtReader &) = delete;
+
+        /**
+         * @brief 移动构造；Move constructor.
+         * @param other 源对象；Source object.
+         */
+        TxtReader(TxtReader &&other) noexcept;
+
+        /**
+         * @brief 移动赋值；Move assignment.
+         * @param other 源对象；Source object.
+         * @return 当前对象引用；Reference to current object.
+         */
+        TxtReader &operator=(TxtReader &&other) noexcept;
+
+    private:
+        /**
+         * @brief 实现体前置声明；Forward declaration of implementation.
+         */
+        struct Impl;
+
+        /**
+         * @brief 唯一实现体指针；Unique pointer of implementation.
+         */
+        std::unique_ptr<Impl> impl_;
+
+        /**
+         * @brief 授权 policy 访问实现体；Grant policy access to implementation.
+         */
+        friend struct TxtFilePolicy;
+    };
+
+    /**
+     * @brief *.txt 写入器实现包装；Implementation wrapper of *.txt writer.
+     */
+    class TxtWriter final
+    {
+    public:
+        /**
+         * @brief 通过路径构造写入器；Construct writer from path.
+         * @param path 输出路径；Output path.
+         */
+        explicit TxtWriter(const std::filesystem::path &path);
+
+        /**
+         * @brief 析构写入器；Destroy writer.
+         */
+        ~TxtWriter();
+
+        /**
+         * @brief 禁止拷贝构造；Copy constructor is disabled.
+         */
+        TxtWriter(const TxtWriter &) = delete;
+
+        /**
+         * @brief 禁止拷贝赋值；Copy assignment is disabled.
+         * @return 当前对象引用；Reference to current object.
+         */
+        TxtWriter &operator=(const TxtWriter &) = delete;
+
+        /**
+         * @brief 移动构造；Move constructor.
+         * @param other 源对象；Source object.
+         */
+        TxtWriter(TxtWriter &&other) noexcept;
+
+        /**
+         * @brief 移动赋值；Move assignment.
+         * @param other 源对象；Source object.
+         * @return 当前对象引用；Reference to current object.
+         */
+        TxtWriter &operator=(TxtWriter &&other) noexcept;
+
+    private:
+        /**
+         * @brief 实现体前置声明；Forward declaration of implementation.
+         */
+        struct Impl;
+
+        /**
+         * @brief 唯一实现体指针；Unique pointer of implementation.
+         */
+        std::unique_ptr<Impl> impl_;
+
+        /**
+         * @brief 授权 policy 访问实现体；Grant policy access to implementation.
+         */
+        friend struct TxtFilePolicy;
+    };
+
+    /**
+     * @brief 矩阵输入 policy 概念；Concept for matrix input policy.
+     * @tparam Policy policy 类型；Policy type.
+     */
+    template <typename Policy>
+    concept MatrixInputPolicy = requires(const std::filesystem::path &path, typename Policy::Reader &reader, Matrix &matrix)
+    {
+        typename Policy::Reader;
+        {
+            Policy::open_reader(path)
+        } -> std::same_as<typename Policy::Reader>;
+        {
+            Policy::read_next(reader, matrix)
+        } -> std::same_as<bool>;
+    };
+
+    /**
+     * @brief 矩阵输出 policy 概念；Concept for matrix output policy.
+     * @tparam Policy policy 类型；Policy type.
+     */
+    template <typename Policy>
+    concept MatrixOutputPolicy = requires(const std::filesystem::path &path,
+                                          typename Policy::Writer &writer,
+                                          const Matrix &matrix)
+    {
+        typename Policy::Writer;
+        {
+            Policy::open_writer(path)
+        } -> std::same_as<typename Policy::Writer>;
+        {
+            Policy::write_next(writer, matrix)
+        } -> std::same_as<void>;
+        {
+            Policy::flush(writer)
+        } -> std::same_as<void>;
+    };
+
+    /**
+     * @brief 矩阵输入流模板；Matrix input stream template.
+     * @tparam Policy 输入 policy；Input policy.
+     */
+    template <MatrixInputPolicy Policy>
+    class MatrixInputStream final
+    {
+    public:
+        /**
+         * @brief 构造输入流；Construct input stream.
+         * @param path 文件路径；File path.
+         */
+        explicit MatrixInputStream(const std::filesystem::path &path)
+            : reader_(Policy::open_reader(path))
+        {
+        }
+
+        /**
+         * @brief 读取下一张矩阵；Read one matrix.
+         * @param matrix 输出矩阵；Output matrix.
+         * @return 成功读取返回 true，EOF 返回 false；Returns true if one matrix is read, false on EOF.
+         */
+        bool read_one(Matrix &matrix)
+        {
+            if (eof_)
+            {
+                return false;
+            }
+
+            const bool has_matrix = Policy::read_next(reader_, matrix);
+            eof_ = !has_matrix;
+            return has_matrix;
+        }
+
+        /**
+         * @brief 操作符重载：读取下一张矩阵；Operator overload: read one matrix.
+         * @param matrix 输出矩阵；Output matrix.
+         * @return 当前输入流对象；Current input stream object.
+         */
+        MatrixInputStream &operator>>(Matrix &matrix)
+        {
+            (void)read_one(matrix);
+            return *this;
+        }
+
+        /**
+         * @brief 是否已到文件末尾；Whether EOF is reached.
+         * @return EOF 状态；EOF state.
+         */
+        [[nodiscard]] bool eof() const noexcept
+        {
+            return eof_;
+        }
+
+        /**
+         * @brief 读取全部矩阵（兼容接口）；Read all matrices (compatibility API).
+         * @return 矩阵序列；Matrix sequence.
+         */
+        [[nodiscard]] std::vector<Matrix> read_all()
+        {
+            std::vector<Matrix> matrices;
+            Matrix matrix;
+            while (read_one(matrix))
+            {
+                matrices.push_back(std::move(matrix));
+            }
+            return matrices;
+        }
+
+        /**
+         * @brief 布尔语义：尚未 EOF；Boolean semantics: not EOF yet.
+         * @return true 表示可继续尝试读取；true means stream can still be read.
+         */
+        explicit operator bool() const noexcept
+        {
+            return !eof_;
+        }
+
+    private:
+        /**
+         * @brief 读取器状态；Reader state.
+         */
+        typename Policy::Reader reader_;
+
+        /**
+         * @brief EOF 状态；EOF state.
+         */
+        bool eof_ = false;
+    };
+
+    /**
+     * @brief 矩阵输出流模板；Matrix output stream template.
+     * @tparam Policy 输出 policy；Output policy.
+     */
+    template <MatrixOutputPolicy Policy>
+    class MatrixOutputStream final
+    {
+    public:
+        /**
+         * @brief 构造输出流；Construct output stream.
+         * @param path 文件路径；File path.
+         */
+        explicit MatrixOutputStream(const std::filesystem::path &path)
+            : writer_(Policy::open_writer(path))
+        {
+        }
+
+        /**
+         * @brief 写入一张矩阵；Write one matrix.
+         * @param matrix 输入矩阵；Input matrix.
+         */
+        void write_one(const Matrix &matrix)
+        {
+            Policy::write_next(writer_, matrix);
+        }
+
+        /**
+         * @brief 操作符重载：写入一张矩阵；Operator overload: write one matrix.
+         * @param matrix 输入矩阵；Input matrix.
+         * @return 当前输出流对象；Current output stream object.
+         */
+        MatrixOutputStream &operator<<(const Matrix &matrix)
+        {
+            write_one(matrix);
+            return *this;
+        }
+
+        /**
+         * @brief 刷新输出；Flush output.
+         */
+        void flush()
+        {
+            Policy::flush(writer_);
+        }
+
+        /**
+         * @brief 写入全部矩阵（兼容接口）；Write all matrices (compatibility API).
+         * @param matrices 矩阵序列；Matrix sequence.
+         */
+        void write_all(std::span<const Matrix> matrices)
+        {
+            for (const Matrix &matrix : matrices)
+            {
+                write_one(matrix);
+            }
+            flush();
+        }
+
+    private:
+        /**
+         * @brief 写入器状态；Writer state.
+         */
+        typename Policy::Writer writer_;
     };
 
     /**
