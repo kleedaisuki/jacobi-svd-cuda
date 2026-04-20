@@ -1,0 +1,46 @@
+﻿# LaTeX intermediate files
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.glg
+*.glo
+*.gls
+*.idx
+*.ilg
+*.ind
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex
+*.synctex.gz
+*.toc
+*.xdv
+
+# Latexmk and arara
+*.dvi
+*.nav
+*.snm
+*.vrb
+
+# Build/cache directories
+_build/
+build/
+out/
+auto/
+
+# Generated PDFs (keep source only)
+*.pdf
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Agents
+
+/AGENTS.md
+/CLAUDE.md

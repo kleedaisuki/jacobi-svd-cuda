@@ -1,0 +1,70 @@
+# latexmkrc for this project
+# Goal: stable XeLaTeX + biblatex/biber workflow on Windows and CI.
+
+# ------------------------------------------------------------
+# 1) Core build mode
+# ------------------------------------------------------------
+# 5 = xelatex -> .xdv, then xdvipdfmx -> .pdf
+$pdf_mode = 5;
+
+# Keep outputs in tex/build/.
+$out_dir = 'build';
+$aux_dir = 'build';
+
+# Ensure build directory exists before compiling.
+if ( !-d $out_dir ) {
+    mkdir $out_dir or die "Cannot create output directory '$out_dir': $!";
+}
+
+# ------------------------------------------------------------
+# 2) TeX engine commands
+# ------------------------------------------------------------
+# %O : options from latexmk
+# %S : source tex file
+$xelatex = 'xelatex -synctex=1 -interaction=nonstopmode -halt-on-error -file-line-error %O %S';
+
+# Keep pdflatex/lualatex definitions for manual fallback.
+$pdflatex = 'pdflatex -synctex=1 -interaction=nonstopmode -halt-on-error -file-line-error %O %S';
+$lualatex = 'lualatex -synctex=1 -interaction=nonstopmode -halt-on-error -file-line-error %O %S';
+
+# ------------------------------------------------------------
+# 3) Bibliography backend (biblatex -> biber)
+# ------------------------------------------------------------
+# %B : basename without extension
+$biber = 'biber --bblencoding=utf8 -u %O %B';
+
+# Force latexmk to respect bibliography tool runs when needed.
+# 2 is recommended in many biblatex projects for robust reruns.
+$bibtex_use = 2;
+
+# ------------------------------------------------------------
+# 4) Build robustness / rerun policy
+# ------------------------------------------------------------
+# Enough reruns for ToC, refs, and bib convergence in one command.
+$max_repeat = 8;
+
+# Generate .fls for dependency tracking.
+$recorder = 1;
+
+# Keep log output visible for diagnostics.
+$silent = 0;
+
+# Emit diagnostics when latexmk decides to rerun rules.
+$diagnostics = 1;
+
+# ------------------------------------------------------------
+# 5) Preview / interaction
+# ------------------------------------------------------------
+# Do not auto-open previewer from latexmk.
+$preview_continuous_mode = 0;
+$pdf_previewer = 'start ""';
+
+# ------------------------------------------------------------
+# 6) Cleaning rules
+# ------------------------------------------------------------
+# Extend default clean targets for XeLaTeX + biblatex workflow.
+$clean_ext .= ' %R.bbl %R.blg %R.run.xml %R.bcf %R.fls %R.fdb_latexmk %R.synctex.gz %R.xdv';
+
+# Also remove common temporary artifacts from index/glossary pipelines
+# if they appear in future.
+$clean_ext .= ' %R.acn %R.acr %R.alg %R.glg %R.glo %R.gls %R.ist';

@@ -4,3 +4,13 @@
 *.ptx
 *.cubin
 *.fatbin
+
+# IDE
+.vscode
+
+# Codex
+AGENTS.md
+
+# Proj local
+
+/experiments
