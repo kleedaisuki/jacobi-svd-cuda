@@ -46,7 +46,7 @@ struct MatMetaData
 
 `io.cpp` 还提供将 *.txt 抽象为矩阵流的函数：数字使用空格区分，行间使用`\n`区分。所以应该用模板元编程抽象出逻辑，将 *.mat 还是 *.txt 作为 Source policy 解耦进行 policy-based design：它们与如何存取字节流无关。读流和写流应当分别封装到两个类，不过也不影响解耦读写动作与序列化/反序列化的设计。
 
-`pipeline.cpp`应用层抽象为：`testcases -> kernel -> output` 三个步骤的映射结合。
+`pipeline.cpp`应用层抽象为：`testcases -> kernel -> output` 三个步骤的映射结合。这里采用“聚合根”的理念，将三个步骤的三个对象组合为一个对象。为避免线程写导致阻塞、统一写导致内存驻留，我们使用生产者-消费者模式组织 output 环节：它作为消费者将结果写出去；线程生命周期在类内部做 RAII 管理。
 
 `main.cpp` 是 CLI 表示层的实现，将命令行参数组装 pipeline。
 
