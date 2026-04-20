@@ -44,7 +44,7 @@ struct MatMetaData
 
 使用网络字节序，矩阵数值使用 `double` 储存。`io.cpp`提供对 *.mat 的矩阵流抽象，在现代 C++ (C++20 及以上) 中，标准库引入了 <bit> 头文件中的 std::byteswap 和 std::endian，这为我们提供了极其优雅的跨平台解决方案。我们使用内存映射文件 (Memory-Mapped Files) 解决问题，`mmap()` (POSIX) / `CreateFileMapping` & `MapViewOfFile` & `FlushViewOfFile` (Windows)。我们定义一个 concept，确保传进来的 Policy 必须具备我们需要的能力。
 
-`io.cpp` 还提供将 *.txt 抽象为矩阵流的函数：数字使用空格区分，行间使用`\n`区分。所以应该用模板元编程抽象出逻辑，将 *.mat 还是 *.txt 作为 Source policy 解耦进行 policy-based design：它们与如何存取字节流无关。
+`io.cpp` 还提供将 *.txt 抽象为矩阵流的函数：数字使用空格区分，行间使用`\n`区分。所以应该用模板元编程抽象出逻辑，将 *.mat 还是 *.txt 作为 Source policy 解耦进行 policy-based design：它们与如何存取字节流无关。读流和写流应当分别封装到两个类，不过也不影响解耦读写动作与序列化/反序列化的设计。
 
 `pipeline.cpp`应用层抽象为：`testcases -> kernel -> output` 三个步骤的映射结合。
 
