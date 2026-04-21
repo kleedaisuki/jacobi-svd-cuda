@@ -2,13 +2,54 @@
 
 \input{preamble}
 
-\title{Jacobi SVD CUDA 技术文档}
-\author{jacobi-svd-cuda}
-\date{\today}
+\newcommand{\DocTitle}{从单边雅可比 SVD 到 CUDA 数值系统\\[0.35em]算法、并行化与工程边界}
+\newcommand{\DocSubtitle}{2025-2026春季学期并行程序设计 SIMD 实验报告}
+\newcommand{\DocAuthor}{jacobi-svd-cuda}
+\newcommand{\DocEmail}{maintainer@example.com}
+\newcommand{\DocDate}{\today}
 
 \begin{document}
 
-\maketitle
+\begin{titlepage}
+    \thispagestyle{empty}
+    \centering
+
+    \vspace*{2.2cm}
+    {\color{blue!45!black}\rule{0.86\textwidth}{0.9pt}\par}
+    \vspace{1.35cm}
+
+    {\parbox{0.82\textwidth}{
+            \centering
+            \zihao{3}\bfseries\color{blue!60!black}
+            \setlength{\baselineskip}{1.42\baselineskip}
+            \DocTitle\par
+        }}
+
+    \vspace{1.0cm}
+    {\large\itshape\color{black!68}\DocSubtitle\par}
+
+    \vfill
+
+    \colorbox{blue!6}{
+        \parbox{0.86\textwidth}{
+            \centering
+            \vspace{0.6cm}
+            \vspace{0.25cm}
+            {\Large\bfseries\DocAuthor\par}
+            \vspace{0.15cm}
+            {\normalsize\texttt{\DocEmail}\par}
+            \vspace{0.45cm}
+            {\normalsize\textsf{\DocDate}\par}
+            \vspace{0.6cm}
+        }
+    }
+
+    \vfill
+    {\color{blue!35!black}\rule{0.86\textwidth}{0.9pt}\par}
+    \vspace{0.35cm}
+    {\small\textsf{CUDA C++ | One-sided Jacobi SVD | Domain-Driven Design}\par}
+\end{titlepage}
+
 \newpage
 \tableofcontents
 \newpage
