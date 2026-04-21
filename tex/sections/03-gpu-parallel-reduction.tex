@@ -1,5 +1,290 @@
-﻿\section{在 GPU 上并行化与规约}
+\section{在 GPU 上并行化与规约}
 
-本章描述 CUDA 并行映射：线程块组织、共享内存使用、规约（reduction）与同步策略。
+前两章把 SVD 的数学结构与单边雅可比（one-sided Jacobi）算法讲清楚了。本章进入
+\texttt{kernels.cu}：我们不再只问“算法是否正确”，而要问一个更工程的问题：
+当这个算法被翻译到 CUDA 体系结构时，哪些数据结构、访存模式、同步边界和规约方式会变成真正的性能边界。
 
-% TODO: 补充 kernel 设计、occupancy、访存模式与性能调优。
+这章的核心观点是：GPU 实现不是把串行伪代码逐行搬到 kernel 里，而是重新组织计算的粒度。
+单边雅可比天然围绕“列对”工作；CUDA 天然围绕 thread、block、warp 和 memory hierarchy 工作。
+好的实现必须让这两套结构互相咬合，而不是互相打架。
+
+\subsection{主机侧契约：RAII 管资源，kernel 管计算}
+
+\texttt{kernels.cu} 的第一层设计不是 kernel，而是资源所有权（resource ownership）。
+设备矩阵由 \texttt{DeviceMatrix} 封装：
+\[
+    \texttt{DeviceMatrix}
+    =
+    (\texttt{rows},\texttt{columns},\texttt{double* data}).
+\]
+它负责 \texttt{cudaMalloc}、\texttt{cudaFree}、主机到设备拷贝（host-to-device copy）和设备到主机拷贝
+（device-to-host copy）。拷贝构造与拷贝赋值被禁用，移动构造与移动赋值被允许。这是典型 RAII
+（Resource Acquisition Is Initialization）策略：对象生命周期就是 GPU 内存生命周期。
+
+这个边界非常重要。CUDA kernel 不能携带复杂 C++ 对象语义，也不应该知道谁拥有内存。kernel 只接收
+\[
+    \texttt{double*},\quad \texttt{const double*},\quad \texttt{int},\quad \texttt{int2*}
+\]
+这样的平坦参数。也就是说：
+
+\begin{quote}
+    主机侧对象负责资源正确性；设备侧函数负责数值变换。不要把所有权、异常、安全检查和数学算子揉成一团。
+\end{quote}
+
+这是一种很朴素但很硬的工程味道。复杂系统里，错误最常发生在边界不清的地方：
+谁释放内存，谁检查错误，谁维护矩阵维度，谁负责同步。当前实现把这些职责拆开：
+\texttt{DeviceMatrix} 管矩阵资源，匿名命名空间内的 \texttt{DeviceBuffer<T>} 管临时数组，
+\texttt{JACOBI\_CUDA\_CHECK} 把 CUDA 错误码转换成异常，kernel 只做裸数据计算。
+
+\subsection{内存布局：行主序的简单性与列算法的张力}
+
+当前实现采用行主序（row-major）一维数组存储矩阵：
+\[
+    \operatorname{index}(i,j)=i\cdot n+j.
+\]
+这带来三个直接好处。第一，主机侧 \texttt{std::vector<double>}、文件读写和 C++ 习惯布局保持一致。
+第二，矩阵只是一段连续内存，不存在二级指针，也没有行指针数组的额外跳转。第三，kernel 接口简单：
+所有矩阵都可以通过裸指针和维度恢复索引。
+
+但这里也有一个必须诚实面对的体系结构代价：单边雅可比是列算法。每次处理列对 $(p,q)$ 时，
+线程需要读取
+\[
+    A[0,p],A[1,p],\ldots,A[m-1,p]
+\]
+和
+\[
+    A[0,q],A[1,q],\ldots,A[m-1,q].
+\]
+在行主序中，相邻行同一列的地址相隔 $n$ 个 \texttt{double}。因此，当一个 warp
+（warp）里的线程分别处理连续行时，它们对同一列的访问是跨步访问（strided access），并不天然形成理想的
+合并访存（memory coalescing）。这就是算法逻辑和内存系统之间的张力：C++ 端最自然的布局，不一定是列规约最舒服的布局。
+
+为什么仍然可以接受这个选择？因为本项目当前更重视实现清晰性、端到端正确性和后续可演化性。
+行主序让 I/O、结果输出、测试断言、\texttt{U} 与 \texttt{V} 的存储都更统一。更激进的版本可以考虑：
+
+\begin{itemize}
+    \item 为工作矩阵 $A$ 使用列主序（column-major），让列规约更接近连续访存；
+    \item 保持主机行主序，但在进入 SVD kernel 前做一次转置（transpose），用额外搬运换规约吞吐；
+    \item 用 tile 把列对加载到共享内存（shared memory），减少重复全局内存读取；
+    \item 对小 $n$ 或固定列数场景，让一个线程处理同一行的 $(p,q)$ 两个元素，利用它们在行主序下相对接近的局部性。
+\end{itemize}
+
+这不是“行主序错了”，而是一个 co-design 取舍：布局越贴近 GPU 列规约，外围系统就越需要额外转置和格式转换；
+布局越贴近 C++/I/O，kernel 侧就越要承受跨步访存。工程上不能假装这个矛盾不存在，喵。
+
+\subsection{从列对到无冲突 round}
+
+串行单边雅可比会遍历所有列对：
+\[
+    (p,q),\qquad 0\le p<q<n.
+\]
+但在 GPU 上，如果两个线程块同时更新 $(p,q)$ 和 $(p,r)$，它们都会写第 $p$ 列，结果就是数据竞争
+（data race）。所以并行化的第一步不是启动更多线程，而是构造无冲突调度。
+
+当前实现使用巡回赛排序（round-robin / tournament ordering）。每个 round 是若干互不共享列的列对：
+\[
+    (p_1,q_1),(p_2,q_2),\ldots,(p_k,q_k),
+    \qquad
+    \{p_i,q_i\}\cap\{p_j,q_j\}=\varnothing\quad(i\ne j).
+\]
+同一 round 内的列对可以并行执行；不同 round 之间必须顺序执行，因为后一个 round 依赖前一个 round 更新后的列。
+
+若 $n$ 是奇数，实现会加入一个 dummy 列参与轮转；凡是匹配到 dummy 的列对会被跳过。
+这样可以统一奇偶情况，避免在调度逻辑里到处写特殊分支。这个小设计很有“好品味”：把边界情况变成普通情况。
+
+\subsection{kernel 管线}
+
+一次 sweep（sweep）由若干 round 组成；每个 round 在设备上执行三类 kernel：
+
+\begin{table}[htbp]
+    \centering
+    \begin{tabular}{lll}
+        \toprule
+        阶段 & kernel                                     & 职责                            \\
+        \midrule
+        统计 & \texttt{pair\_stats\_kernel}               & 为每个列对计算 $\alpha,\beta,\gamma$ \\
+        参数 & \texttt{compute\_rotation\_params\_kernel} & 根据局部 Gram 矩阵计算 $c,s$          \\
+        应用 & \texttt{apply\_rotation\_kernel}           & 把旋转同时应用到 $A$ 与 $V$            \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+其中
+\[
+    \alpha=a_p^Ta_p,\qquad
+    \beta=a_q^Ta_q,\qquad
+    \gamma=a_p^Ta_q.
+\]
+\texttt{pair\_stats\_kernel} 的网格组织是“一列对一个 block”。block 内所有线程分摊行维度：
+\[
+    \texttt{for row = tid; row < m; row += blockDim.x}.
+\]
+每个线程先得到局部和：
+\[
+    \alpha_{\text{local}},\quad
+    \beta_{\text{local}},\quad
+    \gamma_{\text{local}},
+\]
+然后在共享内存中做 block 级规约（block-level reduction），最后由 \texttt{tid==0} 写出该列对的三个统计量。
+
+\texttt{compute\_rotation\_params\_kernel} 读取这些统计量，使用稳定的 Rutishauser 公式计算旋转参数：
+\[
+    \tau=\frac{\beta-\alpha}{2\gamma},\qquad
+    t =
+    \begin{cases}
+        \dfrac{1}{\tau+\sqrt{1+\tau^2}},   & \tau\ge0, \\[1.2em]
+        -\dfrac{1}{-\tau+\sqrt{1+\tau^2}}, & \tau<0,
+    \end{cases}
+\]
+\[
+    c=\frac{1}{\sqrt{1+t^2}},\qquad s=tc.
+\]
+如果
+\[
+    |\gamma|\le \varepsilon\sqrt{\alpha\beta},
+\]
+则认为这对列已经足够正交，令 $c=1,s=0$。为了避免极端下溢附近的除法风险，代码还要求
+\[
+    |\gamma|>10^{-300}.
+\]
+只要某个列对需要旋转，就用 \texttt{atomicExch} 把 \texttt{any\_rotation\_flag} 置为 $1$。
+这个 flag 是 sweep 收敛判断的桥：设备端发现“还有活要干”，主机端在 round 结束后把这个事实拷回 CPU。
+
+\texttt{apply\_rotation\_kernel} 再次以“一列对一个 block”的方式工作。它把同一个 $(c,s)$ 同时应用到
+$A$ 的两列和 $V$ 的两列：
+\[
+    a'_p = c a_p - s a_q,\qquad
+    a'_q = s a_p + c a_q,
+\]
+\[
+    v'_p = c v_p - s v_q,\qquad
+    v'_q = s v_p + c v_q.
+\]
+这里同步更新 $V$ 很关键。若只更新 $A$ 而不更新 $V$，我们只能得到正交化后的列和奇异值，
+却丢掉了右奇异向量。当前实现维护的仍然是
+\[
+    A^{(k)}=A^{(0)}V^{(k)}.
+\]
+
+\subsection{规约：反串行直觉的核心算子}
+
+规约（reduction）是 GPU 编程里最需要换脑子的地方。串行代码里，点积就是一个简单循环：
+\[
+    s=0;\qquad s\leftarrow s+x_i y_i.
+\]
+这个写法的心理模型是“一个累加器走到底”。但 GPU 上如果让一个线程走完整列，其他线程都闲着；
+如果让所有线程同时写同一个累加器，就会出现原子操作热点和不可控顺序。正确的思路是树形合并：
+先让每个线程拥有自己的局部累加器，再把这些局部结果按二叉树合并。
+
+当前实现的 \texttt{pair\_stats\_kernel} 对每个列对一次性规约三个量：
+\[
+    \sum_i a_{ip}^2,\qquad
+    \sum_i a_{iq}^2,\qquad
+    \sum_i a_{ip}a_{iq}.
+\]
+共享内存被切成三段：
+\[
+    \texttt{shared\_pp},\qquad
+    \texttt{shared\_qq},\qquad
+    \texttt{shared\_pq}.
+\]
+每个线程写入自己的槽位后，执行
+\[
+    \texttt{\_\_syncthreads()}
+\]
+保证所有局部和都可见。之后 stride 从 \texttt{blockDim.x/2} 开始，每轮减半：
+\[
+    \texttt{stride}=\frac{B}{2},\frac{B}{4},\ldots,1.
+\]
+当 \texttt{tid < stride} 时，线程把 \texttt{tid+stride} 的值加到 \texttt{tid}。每轮之后再次同步。
+最终 \texttt{shared\_pp[0]}、\texttt{shared\_qq[0]}、\texttt{shared\_pq[0]} 就是整个 block 的规约结果。
+
+这个规约方式有几个值得注意的性质：
+
+\begin{itemize}
+    \item 它假设 block 内线程数按 $2$ 的幂或至少按规整方式使用。当前 \texttt{normalize\_threads\_per\_block}
+          把线程数夹到 $[32,1024]$ 并按 warp 对齐，但并不严格保证 $2$ 的幂；默认 $256$ 是安全的。
+          若用户传入 $384$，当前二分规约会遗漏一部分槽位。这是实现里应当继续收紧的配置约束。
+    \item 它没有使用 warp shuffle（warp-level shuffle）指令。共享内存规约更直观、可移植性好，
+          但在现代 GPU 上，warp 内规约可以用 \texttt{\_\_shfl\_down\_sync} 降低共享内存压力。
+    \item 它的数值求和顺序不同于串行循环。浮点加法不满足结合律（associativity），所以 GPU 结果与 CPU
+          串行结果最后几位不同是正常现象。若需要更高精度，可以考虑 pairwise summation 或 Kahan summation，
+          但这会增加寄存器和指令压力。
+\end{itemize}
+
+收敛后的 \texttt{build\_u\_sigma\_kernel} 也是同一模式：一列一个 block，先规约列范数
+\[
+    \sigma_j=\sqrt{\sum_i a_{ij}^2},
+\]
+再把该列归一化为
+\[
+    u_j=a_j/\sigma_j.
+\]
+这里规约不仅是性能技巧，也是算法语义的一部分：奇异值本身就是列范数。
+
+\subsection{同步边界与代价模型}
+
+这份实现的同步层次很清楚：
+
+\begin{itemize}
+    \item block 内同步由 \texttt{\_\_syncthreads()} 完成，用于共享内存规约；
+    \item kernel launch 边界提供全局同步，保证统计、参数计算、旋转应用按顺序发生；
+    \item round 之间由主机循环顺序化，避免不同 round 的列更新交叉；
+    \item sweep 收敛由 \texttt{any\_rotation\_flag} 从设备拷回主机判断。
+\end{itemize}
+
+这不是最极限的性能路径，但很适合第一版正确实现。它把全局同步放在 kernel 边界，而不是在一个巨大 kernel 内
+试图跨 block 同步。CUDA 的普通 kernel 里没有任意 block 间同步；如果硬要模拟，代码会变得复杂又脆弱。
+从内核工程的眼光看，宁愿接受几个清楚的 kernel launch，也不要把同步语义藏进不可靠的技巧里。
+
+粗略看，每个 round 的主要代价来自两次全矩阵式列访问：一次统计 $(\alpha,\beta,\gamma)$，
+一次应用旋转。每个 sweep 有 $O(n)$ 个 round，每个 round 处理 $O(n)$ 个互不冲突列对，
+所以整体仍然覆盖 $O(n^2)$ 个列对。对每个列对，统计访问 $O(m)$，旋转 $A$ 访问 $O(m)$，
+旋转 $V$ 访问 $O(n)$。因此一轮 sweep 的工作量近似为
+\[
+    O(mn^2+n^3).
+\]
+当 $m\gg n$ 时，$A$ 的列统计与列更新占主导；当 $m$ 与 $n$ 同阶时，维护 $V$ 的成本也不可忽视。
+
+\subsection{当前实现的边界}
+
+当前 \texttt{one\_sided\_jacobi\_svd} 明确要求
+\[
+    m\ge n.
+\]
+这与 thin SVD 的常见场景一致：列数不超过行数，输出 $U\in\mathbb{R}^{m\times n}$、
+$\Sigma\in\mathbb{R}^{n}$、$V\in\mathbb{R}^{n\times n}$。若要支持宽矩阵（wide matrix）$m<n$，
+通常可以对 $A^T$ 做相应分解，或重新设计输出形状和后处理。
+
+另一个边界是收敛判断。当前实现每个 round 都把 \texttt{any\_rotation\_flag} 拷回主机。
+这很清楚，但会引入频繁的小规模 host-device 同步。后续优化可以把 flag 延迟到每个 sweep 结束再归约，
+或让一个设备端数组记录所有 round 状态，减少 CPU 与 GPU 的往返。
+
+最后，行主序布局与列规约之间的冲突会限制带宽利用率。它不是 correctness bug，但它是 performance smell。
+如果未来目标从“清晰正确”转向“吞吐最大化”，最值得优先研究的不是公式，而是数据布局、转置策略、
+tile 化和 warp-level reduction。算法的数学核心已经很小；真正的战场在内存系统。
+
+\subsection{从逻辑模型到体系结构模型}
+
+把单边雅可比放到 CUDA 上，可以得到一张很紧凑的翻译表：
+
+\begin{table}[htbp]
+    \centering
+    \begin{tabular}{ll}
+        \toprule
+        数学对象或动作             & CUDA 实现对象                       \\
+        \midrule
+        矩阵 $A,V,U,\Sigma$   & \texttt{DeviceMatrix} 管理的连续设备内存 \\
+        列对 $(p,q)$          & 一个 \texttt{int2}，一个 block 负责处理  \\
+        列点积与列范数             & block 内共享内存树形规约                 \\
+        Jacobi 旋转参数 $(c,s)$ & 每个列对一组设备数组元素                    \\
+        同一 round 的独立列对      & 多个 block 并行执行                   \\
+        round 间依赖           & 主机循环与 kernel launch 边界          \\
+        sweep 收敛            & 设备 flag 与主机端判断                  \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+这就是 co-design 的核心：数学模型给出“列对旋转”这个局部算子；体系结构要求我们把它拆成
+block 级规约、设备数组暂存、无冲突调度和显式同步边界。写 GPU 程序时，算法和硬件不是先后关系，
+而是互相塑形。一个好的 kernel 不是聪明地掩盖复杂度，而是让复杂度出现在它必须出现的地方。
