@@ -1,5 +1,310 @@
-﻿\section{单边雅可比算法实现 SVD}
+\section{单边雅可比算法实现 SVD}
 
-本章讨论单边雅可比（one-sided Jacobi）如何通过迭代正交化列向量来得到 SVD。
+上一章说明了奇异值分解（Singular Value Decomposition, SVD）的存在性：
+任意矩阵 $A\in\mathbb{R}^{m\times n}$ 都可以写成 $A=U\Sigma V^T$。
+但存在性证明并不自动给出一个好算法。数值线性代数真正关心的问题是：
+在浮点数（floating-point arithmetic）中，怎样以可控误差、可接受复杂度和适合硬件的访存模式得到这个分解。
 
-% TODO: 补充旋转策略、收敛准则、误差分析、伪代码与实现细节。
+本章先把主流 SVD 算法放在同一张地图上，然后解释为什么本项目选择单边雅可比
+（one-sided Jacobi）路线。之后我们进入它的数学模型、几何理解和伪代码。
+
+\subsection{SVD 算法谱系}
+
+SVD 算法大体可以按“先规约再求解”与“直接正交化”分成几类。不同算法并不是简单的优劣关系，
+而是在精度、速度、并行性、实现复杂度和目标矩阵规模之间做不同取舍。
+
+\paragraph{双对角化加 QR 迭代。}
+经典密集矩阵 SVD 通常先用 Householder 反射（Householder reflection）把 $A$ 规约为双对角矩阵
+（bidiagonal matrix）：
+\[
+    A = QBP^T,
+\]
+其中 $Q$、$P$ 正交，$B$ 只有主对角线和一条副对角线非零。之后对 $B$ 做隐式 QR 迭代
+（implicit QR iteration）或相关变体。这个路线结构成熟、稳定，是 LAPACK 等库的核心路径之一。
+它的弱点是：规约阶段和迭代阶段都有较强的数据依赖，直接映射到 GPU 时并不天然舒服。
+
+\paragraph{分治法。}
+分治 SVD（divide-and-conquer SVD）同样从双对角矩阵出发，把问题切成子问题，再通过秩一修正
+（rank-one modification）合并。它在需要全部奇异向量时往往很快，尤其适合中大型密集矩阵。
+代价是实现复杂，工作空间需求较高，而且合并阶段的数值细节比较精巧。
+
+\paragraph{MRRR 与相关特征值路线。}
+有些实现会把 SVD 转化为对称特征值问题（symmetric eigenvalue problem），例如处理
+$A^TA$ 或增广矩阵
+\[
+    \begin{bmatrix}
+        0   & A \\
+        A^T & 0
+    \end{bmatrix}.
+\]
+MRRR（Multiple Relatively Robust Representations）等方法在特征值问题中很重要。
+不过，直接形成 $A^TA$ 会把条件数平方化：
+\[
+    \kappa_2(A^TA)=\kappa_2(A)^2,
+\]
+小奇异值方向会更容易被舍入误差吞掉。对追求鲁棒奇异向量的实现，这通常不是最可爱的选择，呜。
+
+\paragraph{Krylov 与随机化方法。}
+当矩阵巨大且只需要前 $k$ 个奇异值或低秩近似时，Lanczos 双对角化（Lanczos bidiagonalization）、
+块 Krylov 方法（block Krylov method）和随机 SVD（randomized SVD）很有吸引力。
+它们不追求完整分解，而是利用矩阵-向量乘法或矩阵-块乘法提取主子空间。
+这类方法适合稀疏矩阵、大规模机器学习和近似压缩；但本项目要实现的是一个清晰、完整、可验证的 dense SVD kernel，
+因此它们不是第一章算法主线。
+
+\paragraph{雅可比方法。}
+雅可比方法（Jacobi method）通过一系列二维正交旋转消除非对角项。对 SVD 来说有两种常见形式：
+双边雅可比（two-sided Jacobi）直接对对称矩阵或增广结构做左右旋转；单边雅可比则直接旋转 $A$ 的列，
+让列向量逐步正交。雅可比方法通常不是最少浮点操作次数的算法，但它有两个非常硬的优点：
+正交性好，结构局部。对 GPU 来说，“结构局部”意味着我们可以把互不冲突的列对放到并行线程中处理。
+
+\subsection{为什么选择单边雅可比}
+
+本项目选择单边雅可比，不是因为它在所有场景里最快，而是因为它和我们的目标函数匹配得很干净。
+
+\paragraph{第一，避免显式形成 $A^TA$。}
+上一章的存在性证明借助 $A^TA$，但算法实现不必真的形成它。单边雅可比只在每个列对
+$(p,q)$ 上计算三个标量：
+\[
+    \alpha=a_p^Ta_p,\qquad
+    \beta =a_q^Ta_q,\qquad
+    \gamma=a_p^Ta_q.
+\]
+这等价于读取 $2\times 2$ 的局部 Gram 矩阵（Gram matrix）信息，而不是构造完整 $A^TA$。
+这样可以避免条件数平方化带来的系统性风险。
+
+\paragraph{第二，正交性是算法的主目标，而不是副产品。}
+SVD 的核心不是只得到奇异值，而是得到高质量的左右奇异子空间。单边雅可比每一步都直接减少列之间的相关性；
+收敛时，当前矩阵的列已经近似正交。于是左奇异向量只需对列归一化得到：
+\[
+    \sigma_j=\|a_j\|_2,\qquad u_j=a_j/\sigma_j.
+\]
+这种路线非常透明：右奇异矩阵 $V$ 由旋转累积而来，奇异值来自列范数，左奇异矩阵来自归一化列。
+
+\paragraph{第三，旋转是局部原语。}
+一次 Jacobi 旋转只修改两列 $a_p,a_q$，以及右奇异矩阵中的两列 $v_p,v_q$。
+如果一轮中选出的列对互不重叠，例如
+\[
+    (1,2),(3,4),(5,6),\ldots,
+\]
+那么这些旋转没有写冲突，可以并行执行。这一点会直接导向后续章节的巡回赛排序
+（tournament ordering / round-robin ordering）：它把所有列对分批组织成无冲突的 matching。
+
+\paragraph{第四，代码路径容易验证。}
+一个工程实现最怕算法“看起来高级，调起来玄学”。单边雅可比的状态量很少：
+当前工作矩阵 $A^{(k)}$、累积右旋转 $V^{(k)}$、容差 $\varepsilon$、扫尾次数（sweep count）。
+每个旋转之后都可以检查局部 Gram 矩阵的非对角项是否下降；每个 sweep 之后可以检查整体列正交残差。
+这对教学文档、测试和 CUDA kernel 调试都很友好。
+
+\subsection{数学模型}
+
+设初始矩阵为
+\[
+    A^{(0)}=A,\qquad V^{(0)}=I_n.
+\]
+单边雅可比维护不变量
+\[
+    A^{(k)} = A V^{(k)},
+\]
+其中 $V^{(k)}$ 是若干个平面旋转（plane rotation）的乘积，因此始终正交。
+当 $A^{(k)}$ 的列两两正交时，就有
+\[
+    \bigl(A^{(k)}\bigr)^T A^{(k)}
+    =
+    \bigl(V^{(k)}\bigr)^T A^T A V^{(k)}
+    =
+    \operatorname{diag}(\sigma_1^2,\ldots,\sigma_n^2),
+\]
+于是 $V^{(k)}$ 的列就是右奇异向量，$A^{(k)}$ 的列范数就是奇异值。
+
+现在考虑一对列 $(p,q)$。记
+\[
+    a=a_p,\qquad b=a_q,
+\]
+并定义局部 Gram 矩阵
+\[
+    H =
+    \begin{bmatrix}
+        \alpha & \gamma \\
+        \gamma & \beta
+    \end{bmatrix}
+    =
+    \begin{bmatrix}
+        a^Ta & a^Tb \\
+        a^Tb & b^Tb
+    \end{bmatrix}.
+\]
+我们的目标是找一个二维正交旋转
+\[
+    G =
+    \begin{bmatrix}
+        c  & s \\
+        -s & c
+    \end{bmatrix},
+    \qquad c^2+s^2=1,
+\]
+使得更新后的两列
+\[
+    [a'_p,a'_q]=[a_p,a_q]G
+\]
+满足
+\[
+    (a'_p)^T a'_q = 0.
+\]
+等价地，要求
+\[
+    G^T H G
+\]
+的非对角元为 $0$。
+
+令 $t=s/c$。由直接展开可得非对角元为
+\[
+    \gamma(c^2-s^2)+(\alpha-\beta)cs.
+\]
+若 $\gamma\ne0$，令它为 $0$，得到
+\[
+    \gamma t^2 +(\beta-\alpha)t-\gamma=0.
+\]
+设
+\[
+    \tau=\frac{\beta-\alpha}{2\gamma},
+\]
+则
+\[
+    t^2+2\tau t-1=0.
+\]
+为了避免在 $\tau$ 很大时出现灾难性抵消（catastrophic cancellation），使用稳定形式
+\[
+    t =
+    \begin{cases}
+        \dfrac{1}{\tau+\sqrt{1+\tau^2}},   & \tau\ge0, \\[1.2em]
+        -\dfrac{1}{-\tau+\sqrt{1+\tau^2}}, & \tau<0,
+    \end{cases}
+\]
+然后
+\[
+    c=\frac{1}{\sqrt{1+t^2}},\qquad s=tc.
+\]
+若 $\gamma$ 已经足够小，则不做旋转。实际实现中常用相对准则
+\[
+    |\gamma|\le \varepsilon\sqrt{\alpha\beta},
+\]
+其中 $\varepsilon$ 是容差。这个准则比绝对阈值更稳，因为它会随列范数自动缩放。
+
+一次旋转的列更新为
+\[
+    a'_p = c a_p - s a_q,\qquad
+    a'_q = s a_p + c a_q,
+\]
+右奇异向量矩阵同步更新为
+\[
+    v'_p = c v_p - s v_q,\qquad
+    v'_q = s v_p + c v_q.
+\]
+这里的 $V$ 不是最后才补出来的“记录表”，而是算法不变量的一部分：
+每次 $A$ 右乘 $G$，$V$ 也右乘同一个 $G$，从而始终保持 $A^{(k)}=AV^{(k)}$。
+
+\subsection{几何理解}
+
+单边雅可比的几何图像很简单：它在输入空间里不断旋转坐标轴，使得这些坐标轴经过 $A$ 映射后，
+在输出空间里变得互相垂直。
+
+对列对 $(a_p,a_q)$ 来说，当前的两个输入基方向 $e_p,e_q$ 经过 $A^{(k)}$ 后变成输出向量
+$a_p,a_q$。如果 $a_p^Ta_q\ne0$，说明这两个输出方向还没有正交。Jacobi 旋转并不在输出空间里
+硬掰这两个向量，而是在输入平面 $\operatorname{span}\{e_p,e_q\}$ 内换一组正交坐标：
+\[
+    e'_p = c e_p - s e_q,\qquad
+    e'_q = s e_p + c e_q.
+\]
+换完之后，$A$ 作用在新坐标轴上：
+\[
+    A e'_p = a'_p,\qquad A e'_q = a'_q,
+\]
+并且这两个输出向量被构造成正交。
+
+所以单边雅可比不是在“猜”奇异向量；它是在逐步寻找一组输入正交基，使得 $A$ 把这组基映射成一组输出正交向量。
+当所有列对都正交后，事情就结束了：
+\[
+    A V = [\sigma_1u_1,\ldots,\sigma_nu_n].
+\]
+此时每个列向量的方向给出 $u_i$，长度给出 $\sigma_i$。这个过程和上一章存在性证明的逻辑完全吻合，
+只是证明里一次性调用谱定理，算法里则用许多局部旋转把谱定理“磨”出来。
+
+\subsection{伪代码}
+
+下面的伪代码描述串行版本。CUDA 版本不会让线程随意抢列，而是把列对按无冲突批次组织；
+不过数学核心仍然是同一个二维旋转。
+
+\begin{pseudolisting}
+    algorithm OneSidedJacobiSVD(A, epsilon, max_sweeps)
+    input:
+    A: real m by n matrix
+    epsilon: relative orthogonality tolerance
+    max_sweeps: upper bound on sweeps
+    output:
+    U: left singular vectors
+    Sigma: singular values
+    V: right singular vectors
+
+    begin
+    V = Identity(n)
+    converged = false
+    sweeps = 0
+
+    while not converged and sweeps < max_sweeps do
+    converged = true
+    sweeps = sweeps + 1
+
+    for p = 0 to n - 2 do
+    for q = p + 1 to n - 1 do
+    alpha = dot(A[:, p], A[:, p])
+    beta  = dot(A[:, q], A[:, q])
+    gamma = dot(A[:, p], A[:, q])
+
+    threshold = epsilon * sqrt(alpha * beta)
+    if abs(gamma) > threshold then
+    converged = false
+
+    tau = (beta - alpha) / (2 * gamma)
+    if tau >= 0 then
+    t = 1 / (tau + sqrt(1 + tau * tau))
+    else
+    t = -1 / (-tau + sqrt(1 + tau * tau))
+    end if
+
+    c = 1 / sqrt(1 + t * t)
+    s = t * c
+
+    for i = 0 to m - 1 do
+    old_p = A[i, p]
+    old_q = A[i, q]
+    A[i, p] = c * old_p - s * old_q
+    A[i, q] = s * old_p + c * old_q
+    end for
+
+    for i = 0 to n - 1 do
+    old_p = V[i, p]
+    old_q = V[i, q]
+    V[i, p] = c * old_p - s * old_q
+    V[i, q] = s * old_p + c * old_q
+    end for
+    end if
+    end for
+    end for
+    end while
+
+    for j = 0 to n - 1 do
+    Sigma[j] = norm2(A[:, j])
+    if Sigma[j] > epsilon then
+    U[:, j] = A[:, j] / Sigma[j]
+    else
+    U[:, j] = ZeroVector(m)
+    end if
+    end for
+
+    return U, Sigma, V
+    end
+\end{pseudolisting}
+
+这个版本故意保留了最朴素的双重循环，因为它清楚展示了数学不变量。后续 GPU 章节会把
+$(p,q)$ 的遍历方式替换为巡回赛排序，让同一批次里的列对互不重叠，从而把“局部旋转”提升为
+“批量并行旋转”。算法的本体没有改变；改变的是调度。
