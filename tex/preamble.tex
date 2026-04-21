@@ -1,0 +1,99 @@
+﻿% Preamble for Jacobi SVD CUDA document.
+\usepackage[UTF8]{ctex}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{listings}
+\usepackage{tocloft}
+
+\geometry{margin=1in}
+\hypersetup{hidelinks}
+
+% -----------------------------
+% Fancy header/footer
+% -----------------------------
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textsf{Jacobi SVD CUDA}}
+\fancyhead[R]{\small\textsf{\leftmark}}
+\fancyfoot[C]{\small\textsf{\thepage}}
+\renewcommand{\headrulewidth}{0.6pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% -----------------------------
+% Table of contents style
+% -----------------------------
+\renewcommand{\contentsname}{目录}
+\renewcommand{\cfttoctitlefont}{\hfill\bfseries\zihao{3}}
+\renewcommand{\cftaftertoctitle}{\hfill}
+\renewcommand{\cftsecleader}{\cftdotfill{\cftdotsep}}
+\renewcommand{\cftsubsecleader}{\cftdotfill{\cftdotsep}}
+
+% -----------------------------
+% Listings (bash / C/C++ / CUDA / pseudocode)
+% -----------------------------
+\definecolor{lstbg}{RGB}{248,249,251}
+\definecolor{lstcomment}{RGB}{100,110,120}
+\definecolor{lstkeyword}{RGB}{0,77,153}
+\definecolor{lststring}{RGB}{163,21,21}
+\definecolor{lstnumber}{RGB}{120,120,120}
+
+\lstdefinelanguage{bash}{
+    keywords={if,then,else,fi,for,while,do,done,in,function,case,esac,echo,exit,export},
+    sensitive=true,
+    morecomment=[l]{\#},
+    morestring=[b]",
+    morestring=[b]'
+}
+
+\lstdefinelanguage{cuda}{
+    language=C++,
+    morekeywords={
+            __global__,__host__,__device__,__shared__,__constant__,__managed__,
+            __syncthreads,threadIdx,blockIdx,blockDim,gridDim,warpSize,
+            cudaMalloc,cudaFree,cudaMemcpy,cudaMemcpyAsync,cudaMemset,
+            cudaStreamCreate,cudaStreamDestroy,cudaDeviceSynchronize
+        },
+    sensitive=true
+}
+
+\lstdefinelanguage{pseudocode}{
+    keywords={
+            algorithm,procedure,function,begin,end,if,then,else,for,while,repeat,until,
+            return,input,output,true,false,break,continue
+        },
+    sensitive=false,
+    morecomment=[l]{//},
+    morestring=[b]"
+}
+
+\lstdefinestyle{common}{
+    backgroundcolor=\color{lstbg},
+    basicstyle=\ttfamily\small,
+    commentstyle=\color{lstcomment}\itshape,
+    keywordstyle=\color{lstkeyword}\bfseries,
+    stringstyle=\color{lststring},
+    numbers=left,
+    numberstyle=\tiny\color{lstnumber},
+    stepnumber=1,
+    numbersep=8pt,
+    showstringspaces=false,
+    frame=single,
+    framerule=0.2pt,
+    breaklines=true,
+    tabsize=2,
+    keepspaces=true,
+    columns=fullflexible
+}
+
+\lstnewenvironment{bashlisting}{\lstset{style=common,language=bash}}{}
+\lstnewenvironment{clisting}{\lstset{style=common,language=C}}{}
+\lstnewenvironment{cpplisting}{\lstset{style=common,language=C++}}{}
+\lstnewenvironment{cxxlisting}{\lstset{style=common,language=C++}}{}
+\lstnewenvironment{cudalisting}{\lstset{style=common,language=cuda}}{}
+\lstnewenvironment{pseudolisting}{\lstset{style=common,language=pseudocode}}{}

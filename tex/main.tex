@@ -1,0 +1,23 @@
+﻿\documentclass[11pt,a4paper]{article}
+
+\input{preamble}
+
+\title{Jacobi SVD CUDA 技术文档}
+\author{jacobi-svd-cuda}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\input{sections/01-what-is-svd}
+\input{sections/02-one-sided-jacobi-svd}
+\input{sections/03-gpu-parallel-reduction}
+\input{sections/04-memory-mapped-streaming}
+\input{sections/05-pipeline-producer-consumer}
+\input{sections/06-cli-presentation-layer}
+\input{sections/07-cmake-build-system}
+
+\end{document}
