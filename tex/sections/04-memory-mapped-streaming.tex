@@ -59,15 +59,15 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
 二进制 \texttt{*.mat} 文件的单条记录可抽象为：
 \[
     \begin{aligned}
-        R ={}&
+        R ={} &
         \underbrace{
             \texttt{uint64\_be}(rows)\;\Vert\;\texttt{uint64\_be}(columns)
         }_{\text{metadata}}
-        \;\Vert                                                        \\
-        &\underbrace{
-            \texttt{float64\_be}(a_{00})\;\Vert\;\cdots\;\Vert\;
-            \texttt{float64\_be}(a_{m-1,n-1})
-        }_{\text{payload}} .
+        \;\Vert                                                         \\
+              & \underbrace{
+                    \texttt{float64\_be}(a_{00})\;\Vert\;\cdots\;\Vert\;
+                    \texttt{float64\_be}(a_{m-1,n-1})
+                }_{\text{payload}} .
     \end{aligned}
 \]
 其中 \texttt{\_be} 表示大端序（big-endian），也就是网络字节序（network byte order）。
@@ -104,12 +104,12 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
     \centering
     \begin{tabular}{lll}
         \toprule
-        职责     & POSIX                         & Windows                                      \\
+        职责    & POSIX                           & Windows                                             \\
         \midrule
-        打开文件   & \texttt{open}, \texttt{fstat} & \texttt{CreateFileW}                        \\
-        建立映射   & \texttt{mmap}                 & \texttt{CreateFileMappingW}, \texttt{MapViewOfFile} \\
+        打开文件  & \texttt{open}, \texttt{fstat}   & \texttt{CreateFileW}                                \\
+        建立映射  & \texttt{mmap}                   & \texttt{CreateFileMappingW}, \texttt{MapViewOfFile} \\
         释放与刷新 & \texttt{munmap}, \texttt{msync} & \texttt{UnmapViewOfFile}, \texttt{FlushViewOfFile}  \\
-        调整大小   & \texttt{ftruncate}            & \texttt{SetEndOfFile}                       \\
+        调整大小  & \texttt{ftruncate}              & \texttt{SetEndOfFile}                               \\
         \bottomrule
     \end{tabular}
 \end{table}
@@ -418,6 +418,7 @@ I/O 层就需要提供 tile stream 或 block stream，而不是 matrix stream。
 网络字节序解决了字节排列问题，但没有把 \texttt{double} 的语义完全自描述化。
 在现代 HPC 环境中这通常足够；但若追求跨几十年的归档稳定性，文件格式应显式声明 IEEE 754 binary64。
 
+\paragraph{}
 总体而言，这一层把外部持久化介质抽象为一个类型安全的矩阵流，并将格式解析、
 资源管理、错误检测和应用层调度分离到不同责任边界。它不追求炫技式的抽象，而追求一种更朴素的性质：
 坏输入不能越过 I/O 边界，资源不能泄露或重复释放，格式变化不能污染 pipeline 控制流，
