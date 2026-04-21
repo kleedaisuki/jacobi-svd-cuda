@@ -482,7 +482,7 @@ host-device copy、kernel 与 device-host copy 重叠。若后续要追求更高
 
 \subsection{小结}
 
-\texttt{pipeline.cpp} 的设计可以概括为一种保守的系统论文式结构：
+\texttt{pipeline.cpp} 的设计可以概括为一种保守的结构：
 
 \begin{quote}
     用矩阵流定义输入边界，用 kernel stage 定义计算边界，用有界 FIFO 定义计算与输出之间的并发边界，
