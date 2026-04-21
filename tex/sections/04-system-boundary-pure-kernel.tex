@@ -1,0 +1,408 @@
+\section{从 Kernel 到系统：纯函数构件与良构边界}
+
+上一章讨论了 \texttt{kernels.cu} 如何把单边雅可比（one-sided Jacobi）算法映射到 CUDA 的执行结构：
+列对被组织成无冲突 round，规约（reduction）负责计算局部 Gram 信息，kernel launch 之间形成全局同步边界。
+这些内容回答了一个局部问题：\emph{如何让 GPU 正确执行 SVD 的核心数值变换}。但一个可运行、可维护、可复现的
+数值系统还需要回答另一个更上层的问题：\emph{这个 kernel 应该以什么形态嵌入系统}。
+
+本章的核心论点是：CUDA kernel 应当被设计为系统中的纯函数式构件（pure-function-like component），而不是应用程序本身。
+严格地说，CUDA kernel 会修改设备内存、依赖 runtime 调度、消耗 GPU 资源，因此它不是数学意义上的纯函数
+（pure function）。但是在系统边界上，它应当表现得像一个确定的函数：
+\[
+    \operatorname{svd}_{\mathrm{cuda}}:
+    (A, C)
+    \longmapsto
+    (U,\Sigma,V,R),
+\]
+其中 \(A\) 是输入矩阵，\(C\) 是计算配置，\(U,\Sigma,V\) 是 SVD 输出，\(R\) 是执行报告
+（execution report）。文件格式、命令行参数、输出路径、线程队列、内存映射、构建系统和用户脚本都不应该进入这个函数的
+语义内部。换句话说，kernel 是一枚高能、狭窄、可验证的数值构件；良构系统（well-structured system）的任务，
+就是围绕它建立输入、输出、错误、资源和可复现性边界。
+
+\subsection{为什么需要系统边界：高性能代码最怕职责膨胀}
+
+GPU kernel 是整个项目中最昂贵、最难调试、最容易被平台细节影响的部分。它同时面对三类复杂性：
+\begin{itemize}
+    \item \textbf{数学复杂性}：单边雅可比需要维护列正交性、收敛阈值、奇异值提取和左右奇异向量关系；
+    \item \textbf{体系结构复杂性}：CUDA 的 thread、block、warp、shared memory、global memory 与 launch 边界都会影响正确性和性能；
+    \item \textbf{资源复杂性}：设备内存分配、主机到设备拷贝、设备到主机拷贝、错误码与同步时机都必须被正确管理。
+\end{itemize}
+
+如果再让 kernel 层理解 \texttt{*.mat} 文件、文本解析、路径、CLI 默认值、JSON 报告和异步写线程，它就会变成系统中
+所有变化的交汇点。这样的设计在小程序里看似方便，在真实演化中会很快失控：改文件格式会影响 kernel，改命令行会影响
+kernel，改输出顺序也会影响 kernel。最终最难测试的一层承担了最多责任，这正是坏架构的典型形态。
+
+良构边界的目标不是把代码“分层”给图表看，而是降低变化传播（change propagation）。理想情况下：
+\[
+    \Delta\text{CLI}
+    \nrightarrow
+    \Delta\text{Kernel},
+    \qquad
+    \Delta\text{File Format}
+    \nrightarrow
+    \Delta\text{Jacobi Rotation},
+\]
+\[
+    \Delta\text{Output Policy}
+    \nrightarrow
+    \Delta\text{CUDA Memory Layout}.
+\]
+这意味着用户接口、文件系统和持久化策略可以独立演化，而不侵入数值核心。对于一个 CUDA 数值程序，这不是学院派洁癖，
+而是长期调试成本的生命线。
+
+\subsection{轻量 DDD：这里的领域不是业务，而是数值不变量}
+
+领域驱动设计（Domain-Driven Design, DDD）通常出现在复杂业务系统中，例如订单、账户、库存与权限。若机械套用 DDD，
+把每个 C++ 类都命名成实体（Entity）、值对象（Value Object）或仓储（Repository），这个项目会立刻沾上不必要的
+企业应用气味。我们需要的不是术语崇拜，而是 DDD 的一个朴素核心：\emph{系统应围绕领域不变量组织，而不是围绕外部技术细节组织}。
+
+在本项目中，“领域”（domain）不是商业规则，而是 SVD 的数值语义：
+\[
+    A \approx U\Sigma V^T,
+    \qquad
+    U^TU \approx I,
+    \qquad
+    V^TV \approx I,
+\]
+以及单边雅可比迭代中的局部不变量：
+\[
+    a_p^T a_q \rightarrow 0,
+    \qquad
+    \lVert a_p\rVert_2,\lVert a_q\rVert_2
+    \ \text{被正交旋转稳定更新}.
+\]
+这些关系才是系统真正要保护的核心。文件扩展名、命令行拼写、线程队列容量、CMake 生成器都只是让领域核心进入现实世界的
+外层机制。
+
+因此，本项目更适合采用轻量 DDD：只保留“领域核心、应用编排、基础设施、表示层”这些边界思想，不强行引入完整战术模式。
+可以把系统理解为：
+\[
+    \begin{array}{ccl}
+        \text{Presentation}   & : & \texttt{main.cpp}\quad \text{解释用户意图};        \\
+        \text{Application}    & : & \texttt{pipeline.cpp}\quad \text{编排一次端到端用例}; \\
+        \text{Domain Core}    & : & \texttt{kernels.cu}\quad \text{执行 SVD 数值变换}; \\
+        \text{Infrastructure} & : & \texttt{io.cpp}\quad \text{处理文件、字节、平台差异}.
+    \end{array}
+\]
+这个划分并不要求每层必须是独立库；它首先是一组依赖方向和责任边界。真正重要的是：上层可以组合下层，外层可以适配内层，
+但外部世界的偶然细节不应倒灌进数值核心。
+
+\subsection{Kernel 的接口形态：从副作用实现到函数式外观}
+
+CUDA 代码不可能完全摆脱副作用（side effect）。kernel 必须写 global memory，host wrapper 必须分配 device memory，
+\texttt{cudaMemcpy} 必须执行跨设备拷贝，\texttt{cudaDeviceSynchronize} 必须等待异步执行完成。因此，所谓
+“纯函数构件”不是否认底层副作用，而是要求副作用被收束在一个窄边界内，使外部观察到的语义接近函数。
+
+可以把当前 kernel 层抽象为三段：
+\[
+    \operatorname{prepare}
+    \circ
+    \operatorname{compute}
+    \circ
+    \operatorname{collect}.
+\]
+\(\operatorname{prepare}\) 将主机侧矩阵复制到设备侧并初始化工作缓冲；
+\(\operatorname{compute}\) 执行 round-robin Jacobi sweep、列对旋转、收敛检查与 \(U,\Sigma\) 构造；
+\(\operatorname{collect}\) 将结果复制回主机并释放临时资源。副作用发生在这三段内部，但外部接口只看见：
+\[
+    \texttt{JacobiSvdResult}
+    =
+    f(\texttt{MatrixView},\texttt{JacobiSvdConfig}).
+\]
+
+这种函数式外观有四个工程收益。
+
+\paragraph{第一，可测试。}
+测试不需要构造 CLI、不需要创建真实输出文件，也不需要模拟 pipeline。它只需要提供矩阵和配置，然后检查残差：
+\[
+    \frac{\lVert A-U\Sigma V^T\rVert_F}{\lVert A\rVert_F},
+\]
+以及正交性：
+\[
+    \lVert U^TU-I\rVert_F,\qquad \lVert V^TV-I\rVert_F.
+\]
+测试接口越接近数学函数，数值断言就越直接。
+
+\paragraph{第二，可替换。}
+如果未来引入 CPU reference implementation、cuSOLVER baseline、混合精度版本或列主序优化版本，
+pipeline 不应重写。只要它们共享相同的应用层契约：
+\[
+    (A,C)\mapsto (U,\Sigma,V,R),
+\]
+系统就可以把 kernel 看成策略（strategy）而不是命运。
+
+\paragraph{第三，可观测。}
+执行报告 \(R\) 可以记录 sweep 数、是否收敛、矩阵维度、耗时或错误类别。注意报告是输出的一部分，
+而不是通过全局变量、日志副作用或散落的 \texttt{printf} 泄漏出来。这样 CLI 可以选择文本或 JSON，pipeline 可以聚合统计，
+而 kernel 的数值职责仍然保持窄。
+
+\paragraph{第四，可隔离失败。}
+CUDA runtime 错误在 host wrapper 边界被转换为异常或错误对象。上层只需要知道“计算失败”，不需要理解每一个
+\texttt{cudaError\_t} 如何产生。错误细节可以保留在诊断信息中，但错误传播路径必须稳定。
+
+\subsection{反向依赖是坏味道：kernel 不应该认识世界}
+
+为了让边界足够锋利，可以列出 kernel 明确不应知道的东西。
+
+\begin{itemize}
+    \item \textbf{不认识文件格式。} \texttt{kernels.cu} 不应解析 \texttt{*.mat} 头部，也不应处理文本矩阵中的空格与换行；
+    \item \textbf{不认识路径。} 输入输出路径属于 CLI 与 I/O 层，kernel 只接收已经在内存中验证过的矩阵；
+    \item \textbf{不认识输出策略。} 是否写 \(U,\Sigma,V\)，是否追加，是否 JSON 报告，是否异步写，都不是 kernel 问题；
+    \item \textbf{不认识用户意图。} \texttt{--epsilon} 和 \texttt{--max-sweeps} 在进入 kernel 前应已转化为类型化配置；
+    \item \textbf{不认识构建系统。} \texttt{nvcc} driver mode、CMake CUDA language、输出 artifact 路径都不应影响运行时语义；
+    \item \textbf{不拥有长期系统资源。} 文件句柄、映射视图、输出线程和队列生命周期不属于 kernel。
+\end{itemize}
+
+这组否定边界看起来啰嗦，但它们很重要。系统设计经常不是靠“应该做什么”保持清晰，而是靠“绝不做什么”防止坍缩。
+对本项目而言，kernel 的尊严来自克制：它不处理世界，它只处理矩阵。
+
+\subsection{应用层的角色：Pipeline 是用例，不是数学}
+
+\texttt{pipeline.cpp} 位于应用层（application layer）。应用层的核心职责不是实现 SVD，而是组织一次完整用例
+（use case）：
+\[
+    \text{read testcase}
+    \longrightarrow
+    \text{compute SVD}
+    \longrightarrow
+    \text{write result}.
+\]
+它知道输入流、输出流、kernel 配置、队列容量和执行报告，但它不应知道 Jacobi 旋转公式。换言之，pipeline 不是
+“更大的 kernel”，而是 kernel 的调用协议。
+
+可以用一个组合函数描述 pipeline：
+\[
+    \mathcal{P}
+    =
+    \operatorname{write}
+    \circ
+    \operatorname{svd}_{\mathrm{cuda}}
+    \circ
+    \operatorname{read}.
+\]
+这里 \(\operatorname{read}\) 和 \(\operatorname{write}\) 是基础设施适配器提供的能力，
+\(\operatorname{svd}_{\mathrm{cuda}}\) 是领域核心能力。pipeline 的价值在于把三者组合成有序执行，
+并处理跨阶段问题：异常传播、输出顺序、背压（backpressure）、线程生命周期与统计汇总。
+
+这也解释了为什么生产者-消费者模型应位于 pipeline，而不是 kernel。异步写的目标是隔离 GPU 计算路径和文件持久化路径；
+它改变的是系统吞吐结构，不改变 Jacobi 算法本身。把队列放进 kernel 层会混淆两种完全不同的并发：
+GPU 内部的数值并行，以及 CPU 侧阶段之间的系统并发。
+
+\subsection{基础设施层的角色：把脏世界封装在边界上}
+
+\texttt{io.cpp} 处理的是基础设施层（infrastructure layer）问题：文件、字节序、内存映射、平台 API、文本兼容格式与
+错误消息。这些问题重要，但它们不是 SVD 的领域语义。将它们隔离出来有两个收益。
+
+第一，基础设施可以独立优化。例如二进制 \texttt{*.mat} 可以从普通读写演进到内存映射文件
+（Memory-Mapped Files），文本格式可以作为可检查的兼容路径保留，输出可以从同步写演进到追加式映射。
+这些变化不应要求重写 Jacobi sweep。
+
+第二，基础设施可以承担防腐层（anti-corruption layer）职责。外部世界传来的字节可能损坏，路径可能不存在，
+矩阵维度可能溢出，Windows 与 POSIX 的映射 API 也不同。基础设施层负责把这些不稳定输入转化为系统内部稳定对象：
+\[
+    \text{external bytes}
+    \longrightarrow
+    \texttt{io::Matrix}
+    \longrightarrow
+    \text{kernel input}.
+\]
+只有通过这一层验证的数据，才有资格进入昂贵的 GPU 计算。
+
+这正是端口与适配器架构（ports and adapters architecture）的味道：内部核心暴露窄端口，外部世界通过适配器进入。
+我们不必把项目改造成完整的架构框架；只要依赖方向正确，效果就已经出现。
+
+\subsection{表示层的角色：CLI 是意图编译器}
+
+\texttt{main.cpp} 位于表示层（presentation layer）。它面对的是字符串：
+\[
+    argv=(a_0,a_1,\ldots,a_{n-1}).
+\]
+这些字符串本身没有领域意义。只有经过解析、类型转换、默认值归一化和跨字段验证后，它们才变成应用层配置：
+\[
+    argv
+    \longrightarrow
+    \texttt{CliOptions}
+    \longrightarrow
+    \texttt{PipelineConfig}.
+\]
+
+因此，CLI 可以被看成意图编译器（intent compiler）。用户表达“我要对这个文件做 SVD，用这个收敛阈值，把结果写到那里”，
+CLI 把这句话降阶为 pipeline 能执行的配置。它不应该直接打开矩阵文件，不应该启动 CUDA kernel，也不应该写输出矩阵。
+
+这种边界带来一个朴素但强大的性质：用户接口可以变化，而应用核心不必变化。例如未来加入 \texttt{--dry-run}、
+\texttt{--device}、\texttt{--report-json} 或 shell completion，只要最终仍然生成同一类 \texttt{PipelineConfig}，
+pipeline 与 kernel 就不需要知道用户用了哪种表面语法。
+
+\subsection{资源所有权：RAII 是边界纪律，不只是 C++ 技巧}
+
+资源获取即初始化（Resource Acquisition Is Initialization, RAII）在本项目中不只是 C++ 写法偏好，而是系统边界纪律。
+它回答一个非常实际的问题：谁负责释放什么，什么时候释放，失败时是否泄漏。
+
+在 kernel 层，\texttt{DeviceMatrix} 与临时 \texttt{DeviceBuffer<T>} 拥有设备内存；在 I/O 层，映射对象拥有文件映射视图；
+在 pipeline 层，输出消费者对象拥有线程生命周期和队列关闭协议。每个资源都应有唯一所有者（unique owner）：
+\[
+    \operatorname{owner}(r) = o,
+    \qquad
+    \operatorname{lifetime}(r) \subseteq \operatorname{lifetime}(o).
+\]
+这条关系看似普通，却能消除很多 CUDA/C++ 混合程序中的经典错误：重复释放、早释放、异常路径泄漏、线程未 join、
+映射视图悬垂、设备内存跨层漂移。
+
+注意 RAII 与纯函数外观并不矛盾。恰恰相反，正因为内部副作用由 RAII 对象管理，外部接口才可以表现得更接近函数。
+资源纪律越清楚，函数式边界越可信。
+
+\subsection{错误边界：把失败翻译成上层能理解的语言}
+
+系统中的错误有不同来源：
+\[
+    E =
+    E_{\mathrm{cli}}
+    \cup
+    E_{\mathrm{io}}
+    \cup
+    E_{\mathrm{kernel}}
+    \cup
+    E_{\mathrm{pipeline}}
+    \cup
+    E_{\mathrm{build}}.
+\]
+这些错误不应混成一类。CLI 参数错误应在运行前报告；I/O 格式错误应指出文件与偏移；CUDA 错误应保留 runtime 诊断；
+pipeline 错误应说明阶段与线程边界；构建错误应停留在 CMake 或编译器层。
+
+kernel 层尤其需要错误翻译（error translation）。CUDA API 返回 \texttt{cudaError\_t}，这是底层 runtime 语言；
+应用层更需要知道的是“哪次设备操作失败、失败码是什么、发生在何处、是否导致本次 testcase 终止”。因此
+\texttt{JACOBI\_CUDA\_CHECK} 这样的边界宏不是简单的省代码，而是把底层错误提升为系统错误语义。
+
+良构系统的错误传播应满足：
+\[
+    \text{low-level failure}
+    \longrightarrow
+    \text{localized diagnostic}
+    \longrightarrow
+    \text{stable upper-level category}.
+\]
+这样用户看到的是可行动错误，开发者保留了足够诊断信息，而领域核心不用携带 UI 级错误展示逻辑。
+
+\subsection{数据结构边界：矩阵是值，设备指针是实现细节}
+
+从数据结构角度看，系统内部至少存在三种不同层次的“矩阵”：
+\begin{itemize}
+    \item 文件中的矩阵：字节序、头部、载荷和持久化布局；
+    \item 主机侧矩阵：维度加连续 \texttt{std::vector<double>}；
+    \item 设备侧矩阵：维度加 \texttt{double*}，受 CUDA allocation 与 copy 语义约束。
+\end{itemize}
+
+它们不能混为一谈。文件矩阵适合 I/O 层，主机矩阵适合应用层和测试，设备矩阵适合 kernel wrapper。
+若把设备指针暴露给 pipeline，应用层就会开始关心 \texttt{cudaFree}；若把文件映射地址暴露给 kernel，
+数值核心就会开始关心平台页缓存。两种方向都是坏味道。
+
+正确的边界是逐层降噪：
+\[
+    \text{file bytes}
+    \xrightarrow{\text{decode}}
+    \text{host matrix}
+    \xrightarrow{\text{copy}}
+    \text{device matrix}
+    \xrightarrow{\text{compute}}
+    \text{host result}
+    \xrightarrow{\text{encode}}
+    \text{file bytes}.
+\]
+每个箭头都可以被测试、计时和替换。系统复杂性并没有消失，但它被放到了可定位的位置。
+
+\subsection{良构系统的不变量}
+
+围绕纯函数式 kernel，可以列出本项目希望长期保持的一组系统不变量。
+
+\paragraph{不变量一：领域核心只依赖内存中的类型化数据。}
+kernel 入口不接收路径、不接收文件句柄、不接收原始字节流。所有外部输入必须先被解析成维度明确、元素类型明确、
+布局明确的矩阵对象。
+
+\paragraph{不变量二：应用层只编排，不重写领域逻辑。}
+pipeline 可以决定何时读、何时算、何时写、如何处理背压，但不能复制 Jacobi 旋转公式，也不能手写 SVD 后处理逻辑。
+
+\paragraph{不变量三：基础设施层不决定算法语义。}
+I/O 层可以选择 \texttt{*.mat} 或文本格式，可以使用 mmap 或普通读写，但不能改变 \(\epsilon\)、最大 sweep 数、
+列对调度或奇异值排序语义。
+
+\paragraph{不变量四：表示层不越过应用层。}
+CLI 只能生成配置并调用 pipeline。任何为了方便而在 \texttt{main.cpp} 中直接读文件、写矩阵或调用内部 kernel helper
+的做法，都应视为架构回归。
+
+\paragraph{不变量五：错误在边界被翻译，而不是在深处格式化给用户。}
+底层错误应携带诊断信息向上传播，由合适层决定用户可见表达。kernel 不打印用户帮助，I/O 不决定进程退出码，
+pipeline 不解析命令行。
+
+\paragraph{不变量六：构建 artifact 不改变运行语义。}
+CMake 可以选择不同编译路径，但同一源代码、同一配置和同一输入矩阵应暴露相同的应用层契约。性能可能变化，
+接口语义不应变化。
+
+\subsection{从模块图到依赖方向}
+
+把上述思想压缩成一张依赖图，可以得到：
+\[
+    \begin{array}{ccccc}
+        \texttt{main.cpp}
+         & \longrightarrow &
+        \texttt{pipeline.cpp}
+         & \longrightarrow &
+        \{\texttt{io.cpp},\texttt{kernels.cu}\}.
+    \end{array}
+\]
+这张图有两个值得注意的地方。
+
+第一，\texttt{io.cpp} 与 \texttt{kernels.cu} 在应用层之下并列。它们分别处理数据进入系统和数值核心计算，
+二者不应相互依赖。kernel 不读取文件，I/O 不执行 SVD。pipeline 是把它们组合起来的地方。
+
+第二，依赖方向从外向内、从用户意图到系统用例再到具体能力。外层知道内层，内层不反向知道外层。这不是为了画漂亮分层图，
+而是为了让内层稳定。越靠近数学核心，变化频率应越低；越靠近用户和平台，变化频率可以越高。
+
+可以用一个更抽象的公式表达：
+\[
+    \text{System}
+    =
+    \text{Adapters}
+    \circ
+    \text{Application Use Case}
+    \circ
+    \text{Domain Kernel}.
+\]
+这里的 \(\circ\) 不是简单函数复合，而是责任边界的复合：每层只把下一层需要的最小信息传过去。
+
+\subsection{当前实现的边界与风险}
+
+当前实现已经体现了上述方向，但仍有一些需要保持警惕的边界风险。
+
+\paragraph{第一，kernel wrapper 与应用层契约仍可继续收窄。}
+如果未来 \texttt{JacobiSvdConfig} 扩展出更多字段，例如设备 ID、工作区大小或矩阵布局策略，应区分哪些是领域参数，
+哪些是执行参数。领域参数影响数学结果，执行参数影响实现路径；混在一个结构体里会降低可解释性。
+
+\paragraph{第二，结果报告需要稳定 schema。}
+若执行报告未来包含 per-sweep 残差、计时分解或设备信息，应定义稳定字段。否则 CLI JSON、pipeline 汇总和测试断言会被
+临时字符串格式绑住。
+
+\paragraph{第三，替代 kernel 尚未形成统一接口。}
+当前只有 CUDA Jacobi 路径。若未来加入 CPU reference 或 cuSOLVER baseline，应先抽象统一 compute port，再接入实现。
+不要在 pipeline 中通过大量 \texttt{if} 分支散落调用细节。
+
+\paragraph{第四，边界不应被性能优化轻易打穿。}
+高性能项目常有一种诱惑：为了少拷贝、少封装、少函数调用，把 I/O buffer、device pointer 和 pipeline 队列直接揉在一起。
+这种优化必须有测量证据。没有证据时，边界清晰优先；有证据时，也应寻找保持语义边界的优化方式，例如显式 staging buffer、
+异步拷贝或可替换布局策略。
+
+\subsection{小结}
+
+本章把前一章的 CUDA kernel 从“实现细节”提升为“系统构件”来观察。它应当像纯函数一样被调用：
+\[
+    (A,C)\mapsto(U,\Sigma,V,R),
+\]
+即使其内部不可避免地包含设备内存、kernel launch 和 runtime 同步等副作用。这个函数式外观不是美学装饰，
+而是可测试性、可替换性、错误隔离和长期演化的基础。
+
+轻量 DDD 在这里的价值，不是给项目贴上企业架构标签，而是提醒我们：真正的领域核心是 SVD 的数值不变量和 CUDA 执行约束；
+CLI、I/O、pipeline 与 CMake 都是围绕它建立的边界。kernel 不认识文件，不认识路径，不认识用户脚本，也不认识构建目录。
+它只认识矩阵、配置和数值结果。
+
+这样的设计让后续章节自然展开：下一章讨论 I/O 如何把外部字节转化为可计算的矩阵流；再下一章讨论 pipeline 如何把
+输入流、纯函数式 kernel 和输出流组合成端到端用例；随后 CLI 与 CMake 分别定义用户意图边界和实验 artifact 边界。
+这就是一个良构 CUDA 数值系统的脊梁：把最复杂、最昂贵、最脆弱的 kernel 放在最窄、最稳定、最可验证的位置。

@@ -1,0 +1,516 @@
+\section{CMake 构建体系：把数值程序编译成可复现实验}
+
+前几章沿着算法、GPU kernel、I/O、pipeline 与 CLI 的方向逐层展开。本章讨论最后一层安静但关键的基础设施：
+\texttt{CMakeLists.txt}。它看起来只是几十行构建脚本，却实际承担着一个数值系统的实验契约
+（experimental contract）：哪些源文件被纳入可执行程序，哪些编译器前端被允许，哪些语言标准必须成立，
+二进制产物被放到哪里，以及 Windows、Linux 与 CUDA 工具链之间的差异如何被压缩到一个可理解的边界内。
+
+在高性能计算（High Performance Computing, HPC）项目中，构建系统不是附属物。它决定研究者能否在另一台机器上
+复现实验，决定错误是在配置阶段暴露还是在运行时爆炸，也决定项目在从课程实现演进为论文 artifact 时是否还能保持
+可审计性（auditability）。若 \texttt{kernels.cu} 是数值内核，\texttt{CMakeLists.txt} 就是把数值内核、
+主机代码和平台约束缝合起来的编译协议。这个协议越小、越显式、越少魔法，后续的性能调优和工程扩展就越可靠。
+
+\subsection{构建系统的研究对象：从文件集合到可执行 artifact}
+
+本项目当前构建图（build graph）的输出只有一个可执行文件：
+\[
+    \mathcal{B}:
+    \{\texttt{main.cpp},\texttt{pipeline.cpp},\texttt{io.cpp},\texttt{kernels.cu}\}
+    \longrightarrow
+    \texttt{jacobi-svd-cuda}.
+\]
+其中 \texttt{include/} 提供接口边界，\texttt{src/} 提供实现边界，\texttt{build/} 承载最终二进制。构建系统的职责
+不是理解 SVD，也不是管理实验输入输出，而是保证这条映射在工具链允许的范围内尽可能确定。
+
+从 MECE 的角度看，\texttt{CMakeLists.txt} 的职责可以分成四类，彼此不重叠且覆盖当前需求：
+\begin{itemize}
+    \item \textbf{发现工具链}：找到 \texttt{nvcc}，或启用 CMake 原生 CUDA 语言（CUDA language）；
+    \item \textbf{定义编译契约}：固定 C++20/CUDA C++20、包含目录、源文件集合与可分离编译
+          （separable compilation）；
+    \item \textbf{归一化平台差异}：处理 Windows 可执行扩展名、Visual Studio 多配置生成器
+          （multi-config generator）输出路径，以及源文件编码；
+    \item \textbf{暴露可复现入口}：通过同一个目标（target）\texttt{jacobi-svd-cuda} 支持
+          \texttt{cmake --build}，让实验脚本不依赖 IDE 的隐藏状态。
+\end{itemize}
+
+这四件事之外的内容，当前构建系统有意不做：不下载依赖，不猜测 GPU 架构，不自动运行 benchmark，不把论文构建
+和程序构建混在一起。这样的克制符合本项目的工程阶段。一个 CMake 文件越早变成“万能仪表盘”，越容易把平台问题、
+实验问题和领域问题搅在同一锅里，最后谁都说不清是哪一层坏了。
+
+\subsection{最小语言声明：为什么从 \texttt{LANGUAGES NONE} 开始}
+
+项目声明为：
+\begin{bashlisting}
+project(jacobi_svd_cuda LANGUAGES NONE)
+\end{bashlisting}
+
+这不是无意的极简，而是一种延迟承诺（lazy commitment）。普通 CMake 项目常在 \texttt{project()} 中直接声明
+\texttt{CXX CUDA}，让 CMake 立刻探测 C++ 与 CUDA 编译器。对跨平台 CUDA 项目而言，这个动作并不总是廉价。
+特别是在 Windows 上，CMake 原生 CUDA 语言模式往往依赖 Visual Studio CUDA toolset 与生成器状态；若开发者只想用
+\texttt{nvcc} driver mode 快速构建，过早启用 CUDA 语言反而会把配置阶段绑定到更重的 IDE/toolset 组合。
+
+因此，当前脚本先把项目置于无语言状态，再由选项决定构建路线：
+\[
+    \texttt{JACOBI\_USE\_CMAKE\_CUDA\_LANGUAGE}
+    \in
+    \{\texttt{OFF},\texttt{ON}\}.
+\]
+当该选项为 \texttt{OFF} 时，CMake 只负责发现 \texttt{nvcc} 并注册自定义构建命令；当该选项为 \texttt{ON} 时，
+才显式调用 \texttt{enable\_language(CXX)} 与 \texttt{enable\_language(CUDA)}。这把“是否进入 CMake CUDA
+语言模型”从隐式环境假设变成了显式用户选择。
+
+用形式化语言说，配置阶段被拆成两段：
+\[
+    \operatorname{configure}
+    =
+    \operatorname{base}
+    \circ
+    \operatorname{select\_toolchain}.
+\]
+\(\operatorname{base}\) 不要求 CUDA 语言可用，只解析路径、选项和平台；\(\operatorname{select\_toolchain}\)
+根据用户选择进入更具体的编译模型。这个设计牺牲了一点 CMake target 纯度，换来更强的启动鲁棒性。对一个正在演化的
+CUDA 数值项目，这种权衡是合理的：先保证可构建，再逐步收紧构建图。
+
+\subsection{两条编译路径：原生 CUDA 语言与 \texttt{nvcc} driver mode}
+
+当前构建系统提供两条互斥路径。它们不是“高级”和“低级”的关系，而是面向不同工具链现实的两个前端。
+
+\paragraph{第一条路径：CMake 原生 CUDA 语言。}
+当 \texttt{JACOBI\_USE\_CMAKE\_CUDA\_LANGUAGE=ON} 时，CMake 把 \texttt{.cu} 视为一等源文件：
+\begin{bashlisting}
+enable_language(CXX)
+enable_language(CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
+
+add_executable(jacobi-svd-cuda ${JACOBI_SOURCES})
+target_include_directories(jacobi-svd-cuda PRIVATE "${CMAKE_SOURCE_DIR}/include")
+set_target_properties(jacobi-svd-cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+\end{bashlisting}
+
+这条路线的优势是 target 语义更完整。CMake 知道哪些文件属于 CUDA 编译单元，知道如何把 CUDA 编译、设备链接
+（device linking）和宿主链接（host linking）组织进构建图，也能更自然地接入
+\texttt{target\_compile\_features}、\texttt{target\_compile\_options}、安装导出
+（install/export）与测试框架。若项目未来拆分为库目标和多个工具，原生 CUDA 语言应当成为主路径。
+
+这里启用 \texttt{CUDA\_SEPARABLE\_COMPILATION} 是防御性选择。可分离编译允许设备代码跨翻译单元
+（translation unit）组织，并触发必要的设备链接阶段。当前 \texttt{kernels.cu} 尚未形成复杂的多 CUDA
+翻译单元结构，但提前把目标属性放在可见处，能避免未来把设备函数拆出文件时遇到隐式链接失败。
+
+\paragraph{第二条路径：\texttt{nvcc} driver mode。}
+默认路径不启用 CMake CUDA 语言，而是直接寻找 \texttt{nvcc}：
+\begin{bashlisting}
+find_program(JACOBI_NVCC_EXECUTABLE
+             NAMES nvcc
+             HINTS "$ENV{CUDA_PATH}/bin"
+             REQUIRED)
+\end{bashlisting}
+
+随后 CMake 注册一个自定义命令，把所有源文件交给 \texttt{nvcc}：
+\begin{bashlisting}
+add_custom_command(
+    OUTPUT "${JACOBI_EXE_PATH}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${JACOBI_OUTPUT_DIR}"
+    COMMAND "${JACOBI_NVCC_EXECUTABLE}" ${JACOBI_NVCC_ARGS}
+            ${JACOBI_SOURCES} -o "${JACOBI_EXE_PATH}"
+    DEPENDS ${JACOBI_SOURCES}
+    VERBATIM
+)
+
+add_custom_target(jacobi-svd-cuda ALL DEPENDS "${JACOBI_EXE_PATH}")
+\end{bashlisting}
+
+\texttt{nvcc} driver mode 的核心思想是：让 NVIDIA 编译器驱动同时协调 CUDA 编译与宿主 C++ 编译。它绕开了某些
+CMake/Visual Studio/CUDA toolset 组合上的配置摩擦，使项目在安装了 CUDA Toolkit 的环境中更容易先跑起来。
+这条路线也非常适合小型单可执行程序：源文件集合明确，外部依赖为零，链接关系不复杂。
+
+但它的代价也必须诚实写出来。自定义命令不是完整的 CMake target 模型；CMake 对单个源文件的语言属性、
+逐目标编译选项、IDE 源文件分组、依赖扫描和安装导出都掌握得更少。换言之，默认路径是一条现实主义路径，
+不是最终的构建架构。它服务于当前阶段的首要目标：让 C++20/CUDA 12.x 代码在 Windows 与类 Unix 环境中以最低摩擦
+产出同名可执行文件。
+
+\subsection{源文件集合：显式列表胜过目录通配}
+
+当前脚本显式列出源文件：
+\[
+\begin{aligned}
+    \mathcal{S}=\{&
+    \texttt{src/main.cpp},
+    \texttt{src/pipeline.cpp},\\
+    &\texttt{src/io.cpp},
+    \texttt{src/kernels.cu}\}.
+\end{aligned}
+\]
+这比 \texttt{file(GLOB ...)} 更朴素，也更适合研究代码。显式列表具有三个优点：
+\begin{itemize}
+    \item \textbf{审计性}：读者打开 \texttt{CMakeLists.txt} 就能知道 artifact 由哪些实现文件组成；
+    \item \textbf{确定性}：新文件不会因为放进 \texttt{src/} 就悄悄进入构建，避免未完成实验代码污染结果；
+    \item \textbf{变更可见性}：新增或删除编译单元会反映为构建脚本 diff，代码评审时不会被隐藏。
+\end{itemize}
+
+这正是“好品味”的一个小例子：不要让特殊情况藏在工具的自动行为里。对于 Linux kernel 式的工程直觉而言，
+构建图应该像数据结构一样可读。若一个文件参与二进制，它就应当在构建描述中占有明确位置；若它只是实验草稿，
+它就不应被通配规则自动拖进链接器。
+
+当然，显式列表也有维护成本：新增源文件时必须更新 CMake。这个成本在当前规模下是正收益，因为它强迫开发者确认
+模块边界。只有当项目增长到数十个子目录、多个库目标和自动生成文件时，才需要重新评估是否引入更结构化的
+\texttt{add\_subdirectory()} 层次。
+
+\subsection{输出路径契约：把 artifact 放在项目根 \texttt{build/}}
+
+当前输出目录固定为：
+\[
+    \texttt{JACOBI\_OUTPUT\_DIR}=\texttt{\$\{CMAKE\_SOURCE\_DIR\}/build}.
+\]
+Windows 下输出 \texttt{jacobi-svd-cuda.exe}，其他平台输出 \texttt{jacobi-svd-cuda}。这形成了一个稳定用户契约：
+\[
+    \text{build artifact}
+    =
+    \begin{cases}
+        \texttt{build/jacobi-svd-cuda.exe}, & \text{Windows},\\
+        \texttt{build/jacobi-svd-cuda}, & \text{otherwise}.
+    \end{cases}
+\]
+
+从纯 CMake 教义看，把运行产物放到源码根下的 \texttt{build/} 而不是
+\texttt{\$\{CMAKE\_BINARY\_DIR\}} 并不完美。它让“CMake 的二进制目录”和“项目的可执行输出目录”分离，
+也可能在多构建目录并行时产生覆盖。可是从本项目的实验工作流看，这个决定有现实价值：CLI 文档、实验脚本和人工运行
+都可以稳定引用同一位置，而不必知道 CMake 生成目录叫 \texttt{cmake-build-debug}、\texttt{out/build/x64-release}
+还是别的 IDE 私有名字。
+
+原生 CUDA 语言路径还额外处理了多配置生成器：
+\begin{bashlisting}
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER "${config}" config_upper)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${JACOBI_OUTPUT_DIR}")
+endforeach()
+\end{bashlisting}
+
+这是 Windows/Visual Studio 生态中特别重要的一步。单配置生成器（single-config generator）通常在配置时选择
+\texttt{CMAKE\_BUILD\_TYPE}；多配置生成器则在构建时选择 \texttt{Debug} 或 \texttt{Release}，并倾向于把产物放进
+配置子目录。当前脚本把这些配置统一投影到同一 \texttt{build/} 目录，牺牲了同时保存多种配置产物的能力，
+换取命令行层的稳定路径。
+
+这是一种有意识的收敛：本项目不是库发行包，而是单工具数值程序。它更关心“用户下一条命令能否稳定找到程序”，
+而不是“一个构建树里是否长期保留四种优化级别的二进制”。若未来进入 CI 矩阵测试或性能对照阶段，可以把输出路径改成
+\[
+    \texttt{build/\$\{config\}/jacobi-svd-cuda}
+\]
+并同步更新实验脚本；在那之前，单一 artifact 路径更符合项目现实。
+
+\subsection{语言标准与编码：让编译器拒绝隐式漂移}
+
+两条路径都要求 C++20。原生 CUDA 语言路径显式设置：
+\[
+    \texttt{CMAKE\_CXX\_STANDARD}=20,\qquad
+    \texttt{CMAKE\_CUDA\_STANDARD}=20,
+\]
+并关闭扩展：
+\[
+    \texttt{CMAKE\_CXX\_EXTENSIONS}=\texttt{OFF},\qquad
+    \texttt{CMAKE\_CUDA\_EXTENSIONS}=\texttt{OFF}.
+\]
+默认 \texttt{nvcc} driver mode 则传入：
+\[
+    \texttt{-std=c++20}.
+\]
+
+这不是语法偏好，而是接口契约。项目 I/O 层依赖现代 C++ 标准库能力，CUDA 主机代码也与 C++20 编译模型绑定。
+若某台机器悄悄用较旧标准编译，失败应当发生在编译期，而不是以更隐蔽的模板错误、ABI 差异或运行时行为漂移出现。
+
+Windows 上还额外传入：
+\[
+    \texttt{-Xcompiler=/utf-8}.
+\]
+这是一个很小但非常关键的跨文化工程细节。Windows PowerShell 与 MSVC 历史上经常受到本地代码页影响；在中文环境中，
+默认编码可能是 GBK。项目源文件与 LaTeX 文档都应以 UTF-8 为最终状态。对宿主编译器显式指定
+\texttt{/utf-8}，可以避免中文注释、字符串字面量或诊断信息在编译阶段被错误解释。它不改变算法，却保护了项目的
+长期可读性。对于 Klee 这样的中国大陆开发环境，这类细节不是装饰，是 reproducibility 的一部分。
+
+\subsection{包含目录与依赖边界：当前只有项目内头文件}
+
+当前唯一包含目录为：
+\[
+    \texttt{include/}.
+\]
+这意味着构建系统没有外部三方依赖解析，没有包管理器，没有下载步骤，也没有系统库探测。这样的空依赖面非常有价值：
+若构建失败，故障空间主要集中在 CMake、CUDA Toolkit、宿主编译器和项目源代码四类，而不是扩散到复杂依赖森林。
+
+可以把当前依赖关系写成：
+\[
+    D =
+    D_{\mathrm{toolchain}}
+    \cup
+    D_{\mathrm{stdlib}}
+    \cup
+    D_{\mathrm{cuda}}
+    \cup
+    D_{\mathrm{project}}.
+\]
+其中 \(D_{\mathrm{project}}\) 只包含 \texttt{include/} 与 \texttt{src/}。项目没有引入 BLAS、cuSOLVER 或
+第三方 CLI 库，这与前文的教学目标一致：我们要显式展示单边雅可比 SVD 如何从矩阵格式、pipeline 到 CUDA kernel
+端到端运行，而不是把核心行为隐藏在大型库调用之后。
+
+这并不意味着“永远不要依赖”。如果未来要做性能对照，引入 cuSOLVER 作为基线（baseline）是合理的；如果要做严肃测试，
+引入 GoogleTest 或 Catch2 也合理。但依赖应当服务于明确研究问题，而不是为了显得工程化。每一个新依赖都会增加
+供应链状态、版本约束和跨平台失败模式；它必须带来足够收益。
+
+\subsection{构建命令：可复现实验的最小仪式}
+
+在默认路径下，一个干净构建可以写为：
+\begin{bashlisting}
+cmake -S . -B build-cmake
+cmake --build build-cmake
+\end{bashlisting}
+
+产物会被写入项目根的 \texttt{build/}。若要尝试 CMake 原生 CUDA 语言路径：
+\begin{bashlisting}
+cmake -S . -B build-cmake-cuda -DJACOBI_USE_CMAKE_CUDA_LANGUAGE=ON
+cmake --build build-cmake-cuda --config Release
+\end{bashlisting}
+
+这两组命令揭示了构建系统对用户的最小承诺：配置目录可以变化，生成器可以变化，但用户目标名与可执行输出位置保持稳定。
+在论文 artifact 或课程复现实验中，这种稳定性会直接降低沟通成本。读者不必理解项目内部每个 CMake 变量，只需要知道：
+先 configure，再 build，然后运行 \texttt{build/jacobi-svd-cuda}。
+
+更进一步，构建命令本身应当出现在实验记录中。对数值程序而言，仅记录输入矩阵和运行参数是不够的；编译路径同样影响结果。
+例如 \texttt{Debug} 与 \texttt{Release} 的性能不可比较，\texttt{nvcc} 版本差异可能影响优化策略，不同 GPU 架构
+也可能改变浮点执行细节。严肃报告至少应记录：
+\[
+    (\text{CMake version},\text{CUDA Toolkit version},\text{host compiler},
+    \text{build type},\text{GPU model}).
+\]
+当前 CMake 文件尚未自动生成这些元数据，但 CLI 的 JSON 报告未来可以接收它们。构建系统和运行系统在这里会合：
+前者定义 artifact，后者报告 artifact 的行为。
+
+\subsection{正确性不变量：构建系统应保证什么}
+
+可以为当前构建系统提炼出五个不变量（invariant）。这些不变量比具体 CMake 语法更重要，因为它们描述了项目希望长期保持的
+工程性质。
+
+\paragraph{不变量一：源文件集合完整且最小。}
+每一次构建必须包含 CLI、pipeline、I/O 与 CUDA kernel 四个实现单元；同时不应包含未声明的实验源文件。形式化地说：
+\[
+    \operatorname{sources}(\texttt{jacobi-svd-cuda})=\mathcal{S}.
+\]
+若未来新增测试、benchmark 或工具程序，应通过新 target 表达，而不是悄悄塞入主程序源集合。
+
+\paragraph{不变量二：语言标准不随环境漂移。}
+所有有效构建都应在 C++20/CUDA C++20 语义下进行。若工具链不支持，应配置或编译失败。静默降级到 C++17 是错误状态，
+不是兼容模式。
+
+\paragraph{不变量三：artifact 路径对用户稳定。}
+不论 CMake 生成目录如何命名，用户可执行文件都位于 \texttt{build/jacobi-svd-cuda(.exe)}。这支撑文档示例、
+实验脚本和 CLI 章节中的运行契约。
+
+\paragraph{不变量四：Windows 编码显式为 UTF-8。}
+只要通过 \texttt{nvcc} driver mode 在 Windows 编译，宿主编译器就应接收 \texttt{/utf-8}。任何依赖本地代码页的
+构建都不可复现，也不尊重中文源文件的长期维护。
+
+\paragraph{不变量五：工具链选择是显式的。}
+用户通过 \texttt{JACOBI\_USE\_CMAKE\_CUDA\_LANGUAGE} 选择构建前端。构建系统不应基于偶然环境状态偷偷在两条路径之间
+切换，因为这会让同一命令在不同机器上产生难以解释的行为。
+
+\subsection{失败模型：把错误尽早放到正确层}
+
+好的构建系统不只是让成功路径舒服，也要让失败路径可解释。当前设计的失败模型可以分为四层：
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{lll}
+        \toprule
+        失败层次 & 典型原因 & 理想暴露位置 \\
+        \midrule
+        工具发现 & 找不到 \texttt{nvcc} 或 CUDA Toolkit & CMake 配置阶段 \\
+        语言能力 & 编译器不支持 C++20/CUDA C++20 & 配置或编译早期 \\
+        源码错误 & 头文件缺失、模板错误、CUDA API 使用错误 & 编译阶段 \\
+        链接错误 & 设备链接、宿主链接或运行库解析失败 & 链接阶段 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+这个分层很重要。若没有 \texttt{find\_program(... REQUIRED)}，用户可能在构建中途才看到模糊的命令不存在错误；
+若不固定 C++20，用户可能被几十行模板展开淹没，而真正原因只是语言标准不对；若输出路径没有统一，运行脚本可能报告
+“找不到程序”，但真正失败点在构建目录约定不一致。
+
+工程上要追求的不是“永不失败”，而是“在最接近根因的位置失败”。这和前文 CLI 的设计哲学一致：参数错误应在 CLI 层拒绝，
+矩阵格式错误应在 I/O 层拒绝，CUDA runtime 错误应在 kernel 边界转换为异常；构建错误也应在配置或编译阶段以局部原因暴露。
+
+\subsection{复杂度审查：当前 CMake 的好味道与坏味道}
+
+从 Linux kernel 式的审查口味看，当前构建脚本有几处好味道。
+
+第一，控制流浅。顶层只有一个二分选择：原生 CUDA 语言或 \texttt{nvcc} driver mode。没有嵌套平台矩阵，
+没有复杂函数宏，也没有把 CMake 写成另一门大型程序。这使读者可以在一分钟内建立完整心理模型。
+
+第二，路径变量集中。输出目录、源文件集合、可执行路径和 \texttt{nvcc} 参数都以 \texttt{JACOBI\_} 前缀变量表达。
+这降低了字符串重复，也让未来迁移到多 target 时有明确切入点。
+
+第三，默认路径务实。对 Windows CUDA 初学者而言，CMake 原生 CUDA 语言经常把问题引向 Visual Studio 组件安装、
+生成器选择和 CUDA integration 细节。默认使用 \texttt{nvcc} driver mode，能让更多用户先得到可执行程序。
+
+但也存在需要诚实面对的坏味道。
+
+\paragraph{第一，自定义命令降低了 target 语义。}
+\texttt{add\_custom\_target} 产出的 \texttt{jacobi-svd-cuda} 不是普通 \texttt{add\_executable} target。
+这意味着很多 CMake 生态能力不能自然附着其上。若未来需要安装、导出、测试依赖、逐源文件属性或 IDE 集成，
+默认路径会开始拖后腿。
+
+\paragraph{第二，依赖集合没有包含头文件。}
+\texttt{add\_custom\_command(DEPENDS ...)} 当前依赖源文件，但没有显式列出 \texttt{include/*.hpp}。如果只修改头文件，
+某些生成器可能不会重新触发自定义命令。这是实际风险。短期可以把头文件加入 \texttt{JACOBI\_SOURCES} 旁的
+\texttt{JACOBI\_HEADERS} 并加入 \texttt{DEPENDS}；长期则应迁移到原生 target，让编译器依赖扫描接管。
+
+\paragraph{第三，GPU 架构没有显式记录。}
+当前没有设置 \texttt{CMAKE\_CUDA\_ARCHITECTURES} 或 \texttt{-arch=sm\_XX}。这保持了简单，但会让不同机器上的
+\texttt{nvcc} 默认行为影响生成代码。若要进入严肃 benchmark，应显式选择架构，例如面向特定实验 GPU 固定
+\texttt{sm\_89} 或同时生成若干架构的 fat binary（fat binary）。
+
+\paragraph{第四，构建类型没有进入默认 \texttt{nvcc} 路径。}
+原生 CMake target 能自然区分 \texttt{Debug}、\texttt{Release} 与 \texttt{RelWithDebInfo}；自定义 \texttt{nvcc}
+命令当前没有根据构建类型添加 \texttt{-G}、\texttt{-O3}、\texttt{-lineinfo} 等选项。这对功能正确性影响不大，
+但会影响性能解释。论文式实验必须明确编译优化级别，否则吞吐数据缺少上下文。
+
+\paragraph{第五，源码根 \texttt{build/} 作为输出目录可能与 CMake 构建目录混淆。}
+如果用户执行 \texttt{cmake -S . -B build}，CMake 自己的构建树和项目可执行输出目录会重合。当前项目已经有根
+\texttt{build/}，所以这在实践中可能发生。文档应鼓励使用 \texttt{build-cmake} 或 \texttt{out/build} 作为
+CMake 二进制目录，把根 \texttt{build/} 留给最终 artifact。
+
+这些问题都不是灾难，但它们标出了演化方向。真正危险的不是存在坏味道，而是对坏味道没有边界感。现在我们知道它们在哪里，
+就能在项目规模增长时逐一消除。
+
+\subsection{可复现性模型：构建是实验状态的一部分}
+
+数值实验的可复现性（reproducibility）通常被理解为“相同输入得到相同输出”。但对于 CUDA 程序，更完整的状态应写成：
+\[
+    y =
+    f(x;\theta_{\mathrm{alg}},\theta_{\mathrm{cli}},
+        \theta_{\mathrm{build}},\theta_{\mathrm{device}}).
+\]
+其中 \(x\) 是输入矩阵，\(\theta_{\mathrm{alg}}\) 是算法参数，例如 \(\epsilon\) 与最大 sweep 数；
+\(\theta_{\mathrm{cli}}\) 是 CLI 层选项；\(\theta_{\mathrm{build}}\) 包含编译器、标准、优化级别和 GPU 架构；
+\(\theta_{\mathrm{device}}\) 包含实际 GPU、driver 与 runtime 状态。
+
+构建系统至少控制 \(\theta_{\mathrm{build}}\) 的一部分。当前脚本已经固定：
+\[
+    \theta_{\mathrm{build}}
+    \supset
+    \{\texttt{C++20},\texttt{CUDA C++20},\texttt{source set},\texttt{include dir}\}.
+\]
+尚未固定的部分包括：
+\[
+    \{\texttt{build type},\texttt{optimization flags},\texttt{CUDA architecture},
+      \texttt{compiler version metadata}\}.
+\]
+
+如果本文档要接近顶会 artifact 的质感，不能只展示“如何构建”，还要说明“哪些自由度尚未被固定”。这不是自我削弱，
+而是科学诚实。一个系统在可控变量和未控变量之间划线越清楚，别人复现时越知道应该检查哪里。
+
+\subsection{与论文构建的关系：两个构建系统，不要互相污染}
+
+仓库中还有 \texttt{tex/latexmkrc}，用于构建本文档。它和根目录 \texttt{CMakeLists.txt} 服务于不同 artifact：
+\[
+    \texttt{CMakeLists.txt}
+    \longrightarrow
+    \texttt{jacobi-svd-cuda},
+\]
+\[
+    \texttt{tex/latexmkrc}
+    \longrightarrow
+    \texttt{main.pdf}.
+\]
+这两个构建系统应该保持分离。程序构建需要 CUDA Toolkit、宿主编译器和平台链接器；文档构建需要 XeLaTeX、中文字体和
+LaTeX 包。把它们强行合并进一个 CMake 超级构建会制造不必要耦合：用户只想编译程序时不应被 TeX 环境阻塞，
+用户只想读 PDF 时也不应安装 CUDA。
+
+更好的做法是让二者在发布层会合，而不是在构建层纠缠。例如未来可以用 CI 定义两个 job：
+\[
+    \texttt{build-program},\qquad \texttt{build-paper}.
+\]
+二者共享同一 commit，但依赖环境不同，失败也互不污染。若需要生成完整 release artifact，再由上层工作流收集
+\texttt{jacobi-svd-cuda} 与 \texttt{main.pdf}。这种分离体现了软件工程里的单一职责原则（single responsibility
+principle）：每个构建系统只对自己的 artifact 负责。
+
+\subsection{面向未来的 target 化重构}
+
+当前 CMake 文件的下一步演化，不应是堆更多变量，而应是把构建图从“单命令”提升为“target 化架构”。一个合理方向是：
+\[
+\begin{aligned}
+    \texttt{jacobi-svd-core} &: \text{I/O + pipeline + kernels},\\
+    \texttt{jacobi-svd-cli} &: \text{main.cpp + core},\\
+    \texttt{jacobi-svd-tests} &: \text{unit tests + core},\\
+    \texttt{jacobi-svd-bench} &: \text{benchmarks + core}.
+\end{aligned}
+\]
+此时主程序不再直接拥有所有源文件，而是链接核心库：
+\[
+    \texttt{jacobi-svd-cli}
+    \longleftarrow
+    \texttt{jacobi-svd-core}.
+\]
+
+这样做有三类收益。第一，测试可以绕过 CLI，直接调用 I/O、pipeline 或 kernel 包装接口；第二，benchmark 可以共享同一
+核心实现，避免复制源文件集合；第三，安装和导出可以围绕库 target 组织，而不是围绕自定义命令拼接。
+
+但重构也要把握时机。当前项目只有一个可执行程序，过早拆出多 target 可能让读者在构建层消耗过多认知。更好的策略是：
+当测试目录出现、benchmark 需要稳定入口、或核心代码被第二个工具复用时，再进行 target 化。复杂度应由真实需求驱动，
+而不是由“看起来专业”的架构冲动驱动。
+
+\subsection{CI 集成：从可构建到可验证}
+
+持续集成（Continuous Integration, CI）不是简单地“在云上跑一下 CMake”。对 CUDA 项目而言，CI 至少有三种层级：
+\begin{itemize}
+    \item \textbf{配置级 CI}：验证 CMake 能发现工具链、生成构建图；
+    \item \textbf{编译级 CI}：验证源代码能在指定 CUDA/host compiler 组合下生成 artifact；
+    \item \textbf{运行级 CI}：在真实或虚拟 GPU 上运行小矩阵测试，检查 SVD 残差与正交性。
+\end{itemize}
+
+当前仓库还没有 CI 配置，因此本章只能给出设计边界。最小 CI 不应追求覆盖所有 GPU，而应先固定一个已知环境，
+例如 Windows + CUDA 12.8 或 Ubuntu + CUDA 12.x。运行级测试可以选择小矩阵：
+\[
+    A\in\mathbb{R}^{4\times 3},\quad A\in\mathbb{R}^{8\times 8},
+\]
+检查
+\[
+    \frac{\lVert A-U\Sigma V^T\rVert_F}{\lVert A\rVert_F} < \tau,
+    \qquad
+    \lVert V^TV-I\rVert_F < \tau.
+\]
+这样 CI 才真正服务于数值系统，而不是只证明“编译器今天没有报错”。
+
+CI 还应显式保存构建日志和版本元数据。对 CUDA 项目来说，\texttt{nvcc --version}、\texttt{cmake --version}
+和 GPU 型号不是噪声，而是实验上下文。一个顶会 artifact 的读者并不只想知道结果是否通过；他还想知道结果在哪个环境下通过。
+
+\subsection{安装、导出与包边界：现在不做，但要知道为什么}
+
+当前项目没有 \texttt{install()} 规则，也没有 CMake package export。这是合理的，因为本项目的主要交付物是一个
+端到端 CLI 工具和技术文档，而不是供其他项目链接的库。过早设计安装前缀、版本命名空间、导出 target 和 ABI 策略，
+会把注意力从算法正确性与实验复现转移到发行工程。
+
+但如果未来要把核心 SVD 实现作为库发布，就必须重新设计边界：
+\begin{itemize}
+    \item 公共头文件应区分 public/private include；
+    \item 库 target 应提供稳定命名空间，例如 \texttt{jacobi::svd}；
+    \item CUDA runtime 依赖与编译架构应进入导出配置；
+    \item ABI 兼容策略必须明确，尤其是结构体布局、异常边界与 C++ 标准库类型暴露。
+\end{itemize}
+
+这里再次回到“不破坏用户空间”的原则。一旦安装导出被发布，外部用户就可能把它写进自己的构建系统。此后任何 target 名称、
+头文件路径或链接语义的变化都可能成为破坏性变更。当前不做 install/export，是为了避免过早承诺尚未稳定的库 ABI。
+
+\subsection{小结}
+
+\texttt{CMakeLists.txt} 在本项目中不是机械脚本，而是连接研究代码与可复现实验的协议层。它把四个实现文件、
+C++20/CUDA C++20 语言标准、\texttt{include/} 接口目录、Windows 编码约束和稳定输出路径组织成一个可执行 artifact。
+它还通过 \texttt{JACOBI\_USE\_CMAKE\_CUDA\_LANGUAGE} 暴露两条工具链路径：一条面向 CMake 原生 CUDA target 生态，
+一条面向现实环境中更容易成功的 \texttt{nvcc} driver mode。
+
+从系统论文的角度看，本章的核心结论并不是“CMake 应该怎么写”，而是“构建系统应当把哪些实验自由度显式化”。
+当前实现已经固定了源文件集合、语言标准、包含目录、输出位置和基本平台差异；它尚未完全固定优化级别、GPU 架构、
+头文件依赖扫描和版本元数据。这些边界清楚地告诉我们：哪些结果现在可以复现，哪些结果在进入严肃 benchmark 前还需要收紧。
+
+最好的构建系统不是最大的构建系统，而是把复杂度放在正确层次上的构建系统。对于 \texttt{jacobi-svd-cuda}，
+当前 CMake 的价值正在于它足够小、足够显式、足够容易审查。它让读者把注意力放回真正重要的问题：
+单边雅可比 SVD 如何映射到 GPU，矩阵如何稳定进出系统，pipeline 如何隔离计算与写出，以及一个数值程序如何从代码变成
+可被别人重新运行、重新测量、重新质疑的科学 artifact。
