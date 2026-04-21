@@ -24,9 +24,6 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -107,10 +104,6 @@ namespace jacobi::svd::io
         {
 #if defined(__cpp_lib_byteswap) && (__cpp_lib_byteswap >= 202110L)
             return std::byteswap(value);
-#elif defined(_MSC_VER)
-            return static_cast<std::uint64_t>(_byteswap_uint64(value));
-#elif defined(__GNUC__) || defined(__clang__)
-            return static_cast<std::uint64_t>(__builtin_bswap64(value));
 #else
             return ((value & 0x00000000000000FFULL) << 56U) |
                    ((value & 0x000000000000FF00ULL) << 40U) |
