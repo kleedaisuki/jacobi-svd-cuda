@@ -331,7 +331,7 @@ kernel launch 或 \texttt{cudaMemcpy} 失败，是运行时系统状态。前者
 后者通常应终止当前任务并传播诊断。pipeline 再把 worker 异常、写线程异常和关闭路径异常汇总回
 \texttt{JacobiSvdPipeline::run()}。只要任一阶段认为本次输出不可信，就不能报告成功。
 
-\subsection{数据结构边界：同名“矩阵”不是同一种东西}
+\subsection{实体生命周期：同名“矩阵”不是同一种东西}
 
 如果只看名字，系统里到处都是“矩阵”；但从实体生命周期（entity lifecycle）的角度看，
 这些“矩阵”根本不是同一种东西。它们有不同的出生位置、不同的合法操作、不同的所有者，
