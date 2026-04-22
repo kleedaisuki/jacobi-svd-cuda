@@ -7,7 +7,8 @@
 
 本章聚焦 \texttt{io.cpp}。它不是算法层的附属脚本，而是整个系统的数据平面（data plane）：
 它定义了矩阵流的外部格式、跨平台字节序、文件映射生命周期、读写游标、文本兼容格式以及
-policy-based stream 抽象。若说 \texttt{kernels.cu} 处理“如何计算”，那么 \texttt{io.cpp}
+policy-based stream 抽象；最新实现还增加了面向计算派发的单游标读取器（single-cursor dispatch reader）
+与页锁定主机任务缓冲区（pinned host task buffer）。若说 \texttt{kernels.cu} 处理“如何计算”，那么 \texttt{io.cpp}
 处理“什么数据以何种契约进入计算”。在 systems 视角下，这两者同等重要；因为任何计算内核最终都只能处理
 已经被正确表示、正确边界化、正确拥有的数据。
 
@@ -240,6 +241,79 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
 \]
 而不是 $O(mn)$。
 
+\subsection{派发读取：把字节流先送入页锁定任务缓冲}
+
+上面的 \texttt{MatReader} 路径服务于传统矩阵流接口：
+\[
+    \texttt{*.mat\ bytes}
+    \longrightarrow
+    \texttt{Matrix}.
+\]
+新加入的 \texttt{MatDispatchReader} 则面向下一层 pipeline 的任务派发（task dispatch）场景。它不立即把载荷解码为
+\texttt{std::vector<double>}，而是把单条 \texttt{*.mat} 记录拆成更接近调度单元的数据结构：
+\[
+    \texttt{MatDispatchTask}
+    =
+    (\texttt{sequence\_index},\texttt{rows},\texttt{columns},\texttt{buffer}).
+\]
+其中 \texttt{buffer} 是 \texttt{PinnedHostTaskBuffer}，底层通过 \texttt{cudaMallocHost} /
+\texttt{cudaFreeHost} 管理一整块页锁定主机内存（page-locked host memory）。这条路径的核心思想不是替代
+\texttt{MatInputStream}，而是给更高吞吐的生产者-消费者 pipeline 预留一个更合适的输入形态：主线程可以用一个
+单调文件游标顺序读取记录，把原始网络序 payload 放进可复用的 pinned buffer，再把解析、计算或异步拷贝交给后续阶段。
+
+\paragraph{数据结构上，特殊情况被折叠成普通区间。}
+\texttt{PinnedHostTaskBuffer} 没有为输入区、解码区、GPU staging 区分别维护多块 allocation，
+而是把它们表达为同一块连续 pinned memory 内的两个 span：
+\[
+    \underbrace{[0,\texttt{input\_bytes})}_{\text{raw payload}}
+    \quad\Vert\quad
+    \underbrace{[\texttt{input\_bytes},\texttt{input\_bytes}+\texttt{workspace\_bytes})}_{\text{workspace}}.
+\]
+调用者通过 \texttt{mutable\_input\_bytes()} 与 \texttt{mutable\_workspace\_bytes()} 获得两个视图。
+这是一种很朴素的好品味：不是让每个阶段各自发明一套临时缓冲，而是在 I/O 边界把“输入字节”和“后续工作区”
+统一成一个明确拥有者。移动构造和移动赋值只移动指针与大小，拷贝被删除；因此任务可以在线程队列中移动，
+但不会意外复制 pinned memory。
+
+\paragraph{容量策略上，复用比频繁分配更重要。}
+\texttt{reserve(input\_bytes, workspace\_bytes)} 先计算总需求：
+\[
+    required = input\_bytes + workspace\_bytes.
+\]
+若已有容量足够，只更新输入区和工作区大小；若容量不足，则按倍增策略增长，初始下界为
+$64\,\mathrm{KiB}$。因此同一个 \texttt{MatDispatchTask} 可以被读取循环反复复用：小矩阵不会导致频繁
+\texttt{cudaMallocHost} / \texttt{cudaFreeHost}，大矩阵也只在超过历史峰值时触发重新分配。
+这与输出映射的摊还思想一致，只是资源从“文件映射容量”变成了“页锁定主机容量”。
+
+\paragraph{语义上，派发任务保存的是原始载荷而不是已解码矩阵。}
+\texttt{MatDispatchReader::read\_next} 的状态转移为：
+\[
+    \text{read header}
+    \longrightarrow
+    \text{validate dimensions}
+    \longrightarrow
+    \text{reserve pinned buffer}
+    \longrightarrow
+    \text{read payload bytes}
+    \longrightarrow
+    \text{assign sequence index}.
+\]
+载荷仍保持磁盘上的网络字节序。若后续阶段需要传统 \texttt{Matrix}，可以调用
+\texttt{decode\_dispatch\_task\_matrix} 完成逐元素解码；若未来 kernel wrapper 支持直接从 pinned staging buffer
+构造输入，则也可以在工作区中完成解码并与 host-device copy 更紧密地衔接。
+这给 pipeline 留出了演化空间，而没有把 CUDA stream、device pointer 或 kernel 调度塞进 I/O 层。
+
+这里必须保持一个清醒的边界：pinned memory 不是免费资源。页锁定内存不能被操作系统随意换出，过量使用会挤压系统分页能力，
+甚至拖慢整机。于是 \texttt{PinnedHostTaskBuffer} 只能解决“当前任务如何更适合被派发”的问题，
+不能替代有界队列（bounded queue）和背压（backpressure）。真正的内存上界仍然要由 pipeline 控制：
+\[
+    M_{\mathrm{pinned}}
+    \le
+    \sum_{t\in\mathrm{in\ flight}}
+    \texttt{capacity\_bytes}(t).
+\]
+如果 in-flight 任务数无界，pinned buffer 再漂亮也会把系统拖入资源耗尽。因此这条新路径和下一章的生产者-消费者队列
+是一组配套设计：I/O 层让单个任务适合高速派发，pipeline 层决定同时允许多少任务存在。
+
 \subsection{Policy-based stream：把格式差异从控制流中剥离}
 
 \texttt{io.hpp} 中定义了两个 concept：
@@ -318,6 +392,8 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
         头部截断   & \texttt{read\_next} & 记录边界被破坏          \\
         载荷截断   & \texttt{read\_next} & 元数据与实际字节数不一致     \\
         维度溢出   & checked arithmetic  & 输入会导致本机地址空间或容器越界 \\
+        pinned 分配失败 & \texttt{PinnedHostTaskBuffer::reserve} & 主机侧 staging 资源不足 \\
+        派发载荷截断 & \texttt{MatDispatchReader::read\_next} & 任务边界被破坏，不能进入计算队列 \\
         行列不一致  & 文本解析                & 文本矩阵不是矩形结构       \\
         刷新失败   & \texttt{flush}      & 输出持久化状态未知        \\
         \bottomrule
@@ -348,6 +424,7 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
     \item 应用层不需要管理输入缓冲区生命周期；
     \item 多个进程读取同一文件时，页缓存可以共享底层物理页；
     \item 输出追加的高频路径退化为对映射区的 \texttt{memcpy}。
+    \item 派发读取路径可以把原始 payload 放入 pinned buffer，为后续异步 host-device copy 提供必要前提。
 \end{itemize}
 
 但同样存在代价：
@@ -358,6 +435,7 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
     \item 输出扩容需要解除映射、调整文件大小并重新映射；
     \item \texttt{msync} 或 \texttt{FlushViewOfFile} 的同步语义可能成为尾部延迟来源；
     \item 网络序转换仍然是 CPU 上的逐元素循环，不能被 mmap 自动消除。
+    \item pinned memory 会降低操作系统调页自由度，必须通过任务复用和有界 in-flight 数量控制总量。
 \end{itemize}
 
 因此，本章的结论不应是“mmap 总是更快”。更准确的说法是：
@@ -381,6 +459,18 @@ I/O 层的核心领域对象是 \texttt{Matrix}：
 这个接口刻意没有暴露 mmap、文件句柄、字节序或文本解析细节。应用层只看到矩阵对象与 EOF。
 这种边界使 pipeline 可以关注自己的核心问题：如何把输入矩阵送入 CUDA SVD，如何把输出矩阵交给消费者线程，
 如何在计算与写入之间建立背压（backpressure）。
+
+新增的派发接口则更接近高性能 pipeline 的内部边界：
+\[
+    \texttt{bool read\_next(MatDispatchTask\&, workspace\_bytes)}
+\]
+\[
+    \texttt{Matrix decode\_dispatch\_task\_matrix(const MatDispatchTask\&)}.
+\]
+它比 \texttt{read\_one(Matrix\&)} 暴露更多信息：记录序号、原始 payload、预留工作区与 pinned allocation。
+这不是抽象泄漏，而是层间契约的有意细化。传统流接口适合“读出一张矩阵再计算”的简单路径；
+派发接口适合“先把一条记录变成可移动任务，再由后续阶段决定何时解码、何时拷贝、何时计算”的流水线。
+两者共同存在，使项目不必为了高性能路径破坏已有的兼容 API。
 
 与此同时，I/O 层也没有越界承担 GPU 责任。它不会分配 device memory，不会启动 kernel，
 不会管理 CUDA stream，也不会为了“优化”而把文件映射地址直接交给设备侧。这样的克制很重要：
@@ -414,7 +504,27 @@ I/O 层就需要提供 tile stream 或 block stream，而不是 matrix stream。
 \texttt{TxtFilePolicy} 对开发体验很有价值，但它不应被误认为高性能输入路径。
 大规模实验应优先使用 \texttt{*.mat}；文本格式更适合小样例、单元测试和人工检查。
 
-\paragraph{第五，端序被固定，浮点语义仍依赖现实平台。}
+\paragraph{第五，派发读取路径目前只覆盖 \texttt{*.mat}。}
+\texttt{MatDispatchReader} 是二进制格式的专用优化路径，因为它依赖固定大小头部与可直接计数的二进制 payload。
+文本格式需要逐行解析和列数校验，不适合原样塞入同一种 dispatch task。若未来要对文本输入也做异步读取，
+更合理的做法是先把文本解析成 \texttt{Matrix} 或独立的 parsed task，而不是扭曲 \texttt{MatDispatchTask}
+去同时表达两种完全不同的载荷语义。
+
+\paragraph{第六，pinned buffer 只是 host-device 重叠的前置条件。}
+页锁定内存让异步拷贝更有意义，但它本身不会自动带来 CUDA stream 重叠。要真正实现
+\[
+    \text{read/decode}
+    \parallel
+    \text{host-device copy}
+    \parallel
+    \text{kernel}
+    \parallel
+    \text{write}
+\]
+还需要 kernel 层提供异步接口，并由 pipeline 明确管理 stream、事件与任务生命周期。
+因此当前 \texttt{PinnedHostTaskBuffer} 应被理解为一块稳固地基，而不是完整的异步执行框架。
+
+\paragraph{第七，端序被固定，浮点语义仍依赖现实平台。}
 网络字节序解决了字节排列问题，但没有把 \texttt{double} 的语义完全自描述化。
 在现代 HPC 环境中这通常足够；但若追求跨几十年的归档稳定性，文件格式应显式声明 IEEE 754 binary64。
 

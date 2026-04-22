@@ -1,391 +1,510 @@
-\section{Pipeline 聚合根中使用生产者-消费者隔离计算与写}
+\section{全局线程池与重排序缓冲区实现 pipeline 聚合根}
 
-前两章分别讨论了 kernel 的系统边界与文件流数据平面。本章转向 \texttt{pipeline.cpp}：
-它并不引入新的数值算法，也不直接管理底层文件映射，而是把输入、计算与输出组织成一个端到端应用层协议。
-在系统设计视角下，\texttt{pipeline.cpp} 的价值恰恰在于这种“没有算法但有秩序”的部分：
-它定义数据何时进入 kernel，结果何时离开主线程，错误如何跨线程传播，资源生命周期如何收束，
-以及慢速 I/O 如何不把整个计算路径拖入不可控的阻塞。
+前两章分别讨论了 CUDA kernel 的系统边界与文件流数据平面。本章转向
+\texttt{pipeline.cpp}。它不引入新的数值算法，也不直接管理底层文件映射；
+它的任务更像一个应用层协议编译器：把输入矩阵流、Jacobi SVD kernel、输出矩阵流、线程调度与失败传播
+组合成一个端到端执行对象。
 
-本章的核心命题是：\texttt{JacobiSvdPipeline} 是应用层聚合根（aggregate root），
-它将
+这一章需要更新一个关键事实：当前 \texttt{pipeline.cpp} 已经不再是“主线程串行计算，
+写线程异步落盘”的简单生产者-消费者（producer-consumer）结构。新的实现引入了全局线程池
+（global thread pool）与重排序缓冲区（reorder buffer）。主线程只保留单游标读取与任务派发权；
+计算任务进入全局线程池并发执行；完成后的结果可能乱序抵达输出阶段；写线程再用重排序缓冲区恢复
+testcase 顺序，最终按
+\[
+    (U_0,\Sigma_0,V_0),
+    (U_1,\Sigma_1,V_1),
+    \ldots
+\]
+写出。
+
+本章的核心命题是：\texttt{JacobiSvdPipeline} 是应用层聚合根（aggregate root），它将
 \[
     \texttt{testcases}
     \longrightarrow
+    \texttt{global thread pool}
+    \longrightarrow
     \texttt{kernel}
+    \longrightarrow
+    \texttt{reorder buffer}
     \longrightarrow
     \texttt{output}
 \]
-这一映射封装为单一对象；其中输出阶段被实现为有界生产者-消费者
-（bounded producer-consumer）队列，以隔离 GPU 计算路径与持久化写路径。这个设计不是为了炫技式并发，
-而是为了获得三个系统性质：有限内存驻留、明确背压（backpressure）和可恢复的故障语义
-（failure semantics）。
+封装为单一执行边界。这里的并发不是为了把代码写得“更热闹”，而是为了获得四个系统性质：
+可控的并发总量、有序的输出契约、有限的结果驻留，以及跨线程错误不静默丢失。
 
-\subsection{应用层职责：组合领域对象，而不是侵入领域对象}
+\subsection{应用层职责：拥有调度权，而不偷走领域语义}
 
-\texttt{pipeline.cpp} 位于项目的应用层。它上承 \texttt{main.cpp} 的命令行配置，
-下接 \texttt{io.cpp} 的矩阵流和 \texttt{kernels.cu} 的 SVD 计算。其职责可以形式化为：
-\[
-    \mathcal{P}(C)
-    =
-    \left(
-        \mathcal{S}_{in},
-        \mathcal{K},
-        \mathcal{S}_{out},
-        Q
-    \right),
-\]
-其中 $C$ 是 \texttt{PipelineConfig}，$\mathcal{S}_{in}$ 是输入矩阵流，$\mathcal{K}$
-是 Jacobi SVD kernel 阶段，$\mathcal{S}_{out}$ 是输出矩阵流，$Q$ 是连接计算与写出的有界队列。
-
-这层代码有一个重要的负面边界：它不重新解释矩阵格式，不实现 SVD，不持有 CUDA 设备资源细节，
-也不把命令行参数解析散落进计算逻辑。换言之，它只做组合（composition）：
+\texttt{pipeline.cpp} 位于 \texttt{main.cpp} 与底层领域对象之间。上层 CLI 把用户意图归一化为
+\texttt{PipelineConfig}；下层 \texttt{io.cpp} 负责矩阵流与派发任务；\texttt{kernels.cu}
+负责单个矩阵的 SVD。pipeline 层只做组合（composition）与调度（scheduling）：
 
 \begin{itemize}
-    \item \texttt{TestcaseSource} 把路径与格式解析为统一的输入流；
-    \item \texttt{KernelStage} 把单个 \texttt{io::Matrix} 映射为一个 SVD 输出数据包；
-    \item \texttt{AsyncOutputStage} 把输出数据包异步落盘；
-    \item \texttt{JacobiSvdPipeline::run} 维护端到端状态转移与执行报告。
+    \item 解析输入、输出格式，并拒绝空路径；
+    \item 在需要时执行布局转置阈值自动调优（layout-transpose threshold auto-tuning）；
+    \item 为每个 testcase 构造一个带序号的任务；
+    \item 将任务提交到全局线程池；
+    \item 用 \texttt{future} 观察工作线程异常；
+    \item 将完成结果交给带重排序缓冲区的输出阶段；
+    \item 在成功路径上关闭输出并检查是否缺包，在异常路径上中止输出并传播错误。
 \end{itemize}
 
-这种分层符合一个朴素但强硬的工程原则：边界对象应当拥有调度权，而不应当偷走领域对象的语义。
-I/O 层负责“怎样读写矩阵”，kernel 层负责“怎样计算 SVD”，pipeline 层负责“怎样把二者接成一个可运行系统”。
-如果把这些职责合并到一个大函数中，短期看似减少了类型数量，长期则会让错误处理、测试替换、格式扩展和性能定位
-全部纠缠在一起。
+它明确不做另外几件事：不解析 \texttt{*.mat} 的网络字节序，不实现 Jacobi 旋转，不决定 CUDA
+矩阵布局，也不把命令行选项散落进 kernel 调用内部。这种边界感很重要。系统代码最怕一种“好心”的大函数：
+它读文件、跑算法、写结果、处理异常、打印日志，最后所有状态互相纠缠。当前 pipeline 的好品味在于，
+它只拥有执行顺序，不拥有每一层的内部语义。
 
-\subsection{配置解析与格式契约}
+如果把当前结构形式化，可以写成：
+\[
+    \begin{aligned}
+        X_i
+         & \xrightarrow{\text{dispatch}}
+        T_i
+        \xrightarrow{\text{thread pool}}
+        P_i=(i,s_i,U_i,\Sigma_i,V_i)             \\
+         & \xrightarrow{\text{completion queue}}
+        B
+        \xrightarrow{\text{ordered flush}}
+        (U_i,\Sigma_i,V_i).
+    \end{aligned}
+\]
+其中 $X_i$ 是第 $i$ 个输入矩阵，$T_i$ 是带序号的工作任务，$P_i$ 是输出数据包，
+$B$ 是按 testcase index 索引的重排序缓冲区。
 
-\texttt{PipelineConfig} 是应用层的唯一外部输入契约。它包含输入路径、输出路径、输入格式、输出格式、
-输出队列容量以及 \texttt{JacobiSvdConfig}。在 \texttt{run()} 的开端，pipeline 首先拒绝空路径：
+\subsection{运行时归一化：先确定契约，再启动并发}
+
+\texttt{JacobiSvdPipeline::run} 的开头仍然保持保守路径。首先检查输入路径与输出路径不能为空：
 \[
     \texttt{input\_path}\ne\varnothing,\qquad
     \texttt{output\_path}\ne\varnothing.
 \]
 随后，\texttt{resolve\_file\_format} 将 \texttt{auto\_detect} 解析为具体格式。
-自动识别只接受 \texttt{.mat} 与 \texttt{.txt} 两类扩展名；未知扩展名立即触发异常。
+自动识别只接受 \texttt{.mat} 与 \texttt{.txt}。未知扩展名立即报错，而不是交给下游“试试看”。
 
-这个选择看起来保守，但它避免了一类常见系统错误：用猜测替代契约。文件格式不是 UI 层的小便利，
-而是整个数据平面的 ABI。若扩展名无法确定，pipeline 不应尝试“读一读看”；因为一旦错误格式被传入下游，
-故障位置会从应用边界漂移到序列化细节甚至 GPU kernel。当前实现把失败固定在配置解析阶段，
-这使错误更早、更局部、更可诊断。
+这是一条很朴素但很硬的边界：文件格式属于数据平面 ABI，不应靠猜测进入系统深处。
+一旦错误格式被送进 I/O 或 kernel，失败位置就会漂移，诊断成本也会变高。
+在配置边界处拒绝，是最便宜、最可解释的失败。
 
-\subsection{输入阶段：把异构流折叠为单一 read\_next}
-
-\texttt{TestcaseSource} 使用 \texttt{std::variant} 持有
+格式解析之后，pipeline 会构造运行时 kernel 配置：
 \[
-    \texttt{io::MatInputStream}
-    \quad\text{or}\quad
-    \texttt{io::TxtInputStream}.
+    C_{\mathrm{runtime}} \leftarrow C_{\mathrm{user}}.
 \]
-它对外只暴露一个操作：
-\[
-    \texttt{bool read\_next(io::Matrix\& matrix)}.
-\]
-内部通过 \texttt{std::visit} 分发到具体流实现。这里没有继承层次，也没有虚函数表；
-格式选择在构造时完成，后续读取只经过一个局部 variant 分派。
+若用户启用了 \texttt{layout\_transpose\_auto\_tune}，且布局转置模式仍为
+\texttt{auto\_select}，pipeline 会先调用 \texttt{auto\_tune\_layout\_transpose\_threshold}，
+把推荐阈值写回运行时配置，再关闭本次执行中的自动调优标志。
 
-从状态机角度看，输入阶段是一个单调游标：
+这个顺序也有系统含义：自动调优是一次运行前的配置归一化，而不是每个工作线程各自做的事情。
+如果把调优塞进并发任务内部，就会出现重复 benchmark、设备争用和报告语义混乱。当前实现先把配置稳定下来，
+再创建 \texttt{KernelStage}，这是更清楚的依赖方向。
+
+\subsection{两个输入路径：二进制派发任务与文本矩阵流}
+
+当前 pipeline 对 \texttt{*.mat} 与 \texttt{*.txt} 输入采用两条不同路径，但它们最终都会归约为
+“带序号的线程池任务”。
+
+\paragraph{二进制 \texttt{*.mat} 路径。}
+若输入格式为 \texttt{mat}，主线程使用 \texttt{io::MatDispatchReader}。它不是传统的
+\texttt{read\_one(Matrix\&)}，而是读取一个 \texttt{MatDispatchTask}：
 \[
-    \mathcal{S}_{in}
+    \texttt{MatDispatchTask}
     =
-    (\texttt{stream},\texttt{cursor},\texttt{eof}).
+    (\texttt{sequence\_index},\texttt{rows},\texttt{columns},\texttt{buffer}).
 \]
-每次成功读取都会产生一张完整矩阵；到达 EOF 后返回 \texttt{false}，主循环自然终止。
-这使 pipeline 不需要理解 \texttt{*.mat} 的元数据布局，也不需要理解文本矩阵之间的空行约定。
-它只看到一个由矩阵组成的有限序列：
+\texttt{buffer} 底层是页锁定主机内存（page-locked host memory），由 \texttt{cudaMallocHost}
+管理。主线程按单调游标读取文件记录，把原始 payload 放入 pinned buffer，并把任务移动进工作线程。
+真正的网络序解码由工作线程调用 \texttt{decode\_dispatch\_task\_matrix} 完成：
 \[
-    X_0,X_1,\ldots,X_{N-1}.
+    \text{raw network-order payload}
+    \longrightarrow
+    \texttt{io::Matrix}.
 \]
 
-这样的接口边界非常重要。由于单边雅可比 dense SVD 本身需要完整矩阵参与迭代，pipeline 的输入粒度选择为
-“矩阵级”（matrix-level）而不是“字节级”或“tile 级”。这不是普适最优粒度，而是与当前算法匹配的最小清晰粒度。
-若未来改为分块 SVD 或 out-of-core 算法，这一边界才需要被重新设计。
+这条路径把“文件游标”与“CPU 解码 / GPU 计算”分离开了。文件读取仍然保持单游标、顺序、易审计；
+但读取到的记录可以被移交给线程池。换句话说，主线程不再为每张矩阵承担完整解码与 SVD 的临界路径。
 
-\subsection{计算阶段：从测试矩阵到输出数据包}
-
-\texttt{KernelStage} 是非常薄的一层，但它承担了两个关键职责：输入验证与结果重组。
-对第 $i$ 个测试用例 $X_i$，计算阶段执行函数
+\paragraph{文本 \texttt{*.txt} 路径。}
+若输入格式为 \texttt{txt}，主线程使用 \texttt{TextTestcaseSource}，内部持有
+\texttt{io::TxtInputStream}。文本格式必须逐行解析、检查行列一致性，因此当前实现仍在主线程生成
+\texttt{io::Matrix}，再把完整矩阵移动进工作线程：
 \[
-    \mathcal{K}(X_i)
-    =
-    (U_i,\Sigma_i,V_i,s_i),
-\]
-其中 $s_i$ 是实际 sweep 次数。对应代码中的 \texttt{OutputPacket}：
-\[
-    P_i
-    =
-    (i,s_i,U_i,\Sigma_i,V_i).
+    \texttt{TxtInputStream}
+    \longrightarrow
+    \texttt{io::Matrix}
+    \longrightarrow
+    \text{thread-pool task}.
 \]
 
-在调用 \texttt{one\_sided\_jacobi\_svd} 之前，\texttt{validate\_testcase\_matrix} 检查两类前置条件。
-第一，矩阵维度不能为零：
-\[
-    rows>0,\qquad columns>0.
-\]
-第二，载荷长度必须精确等于
-\[
-    rows\cdot columns.
-\]
-乘法由 \texttt{checked\_element\_count} 做溢出检查。这里的验证虽然短，却决定了 kernel 层能否保持简单。
-GPU kernel 不应承担畸形主机数据的语义修复；在进入 kernel 前拒绝坏矩阵，是更稳妥的系统边界。
+这不是抽象不一致，而是对两种格式现实成本的承认。\texttt{*.mat} 记录有固定头部和可计数 payload，
+天然适合派发；文本矩阵需要语法解析，不适合把原始字节伪装成同一种二进制任务。系统设计中，
+统一接口是好事，但强行统一不同语义就是坏味道。
 
-结果重组也有明确契约。SVD kernel 返回的 \texttt{JacobiSvdResult} 被转成三张矩阵：
-\[
-    U_i\in\mathbb{R}^{m_i\times n_i},
-    \qquad
-    \Sigma_i\in\mathbb{R}^{1\times n_i},
-    \qquad
-    V_i\in\mathbb{R}^{n_i\times n_i}.
-\]
-\texttt{Sigma} 被编码为 $1\times n$ 矩阵，而不是裸数组。这个选择让输出阶段只需要处理一种对象：
-\texttt{io::Matrix}。它减少了格式层的特判，也使 \texttt{*.mat} 与 \texttt{*.txt} 的写出协议保持统一。
+\subsection{全局线程池：控制线程总量，而不是每轮重新造线程}
 
-\subsection{为什么输出需要异步化}
+新的 \texttt{GlobalThreadPool} 是一个进程内惰性初始化（lazy initialization）的全局对象：
+\[
+    \texttt{global\_thread\_pool()}
+    \Rightarrow
+    \texttt{static GlobalThreadPool pool(default\_thread\_pool\_size())}.
+\]
+默认线程数来自 \texttt{std::thread::hardware\_concurrency()}；若系统无法报告硬件并发数，
+则回退为 $4$。构造函数一次性启动工作线程，析构函数设置 \texttt{stopping\_}，
+唤醒所有 worker，并逐个 \texttt{join}。
 
-最直接的 pipeline 可以写成：
+任务提交通过 \texttt{std::packaged\_task<void()>} 包装 callable，并返回
+\texttt{std::future<void>}：
 \[
-    \texttt{read}
-    \rightarrow
-    \texttt{compute}
-    \rightarrow
-    \texttt{write}
-    \rightarrow
-    \texttt{read}
-    \rightarrow
-    \cdots
+    \texttt{submit}(f)
+    \longrightarrow
+    \texttt{future}.
 \]
-这种串行结构具有最小实现复杂度，但会把计算路径与持久化路径绑定在同一个临界路径上。
-对第 $i$ 个测试用例，单步耗时可粗略表示为
+工作线程主循环很小：
 \[
-    T_i = R_i + C_i + W_i,
+    \text{wait until } \texttt{stopping\_}\lor \neg Q.empty()
+    \longrightarrow
+    \text{pop one task}
+    \longrightarrow
+    \text{execute outside lock}.
 \]
-其中 $R_i$ 是读取时间，$C_i$ 是 SVD 计算时间，$W_i$ 是写出时间。若写出阶段偶尔因为文件系统刷新、
-扩容重映射、磁盘抖动或文本格式化变慢，则主线程会完全停在 \texttt{write} 上，GPU 计算也无法开始下一例。
 
-\texttt{pipeline.cpp} 的设计将其改写为：
-\[
-    \texttt{producer}: \quad
-    \texttt{read}\rightarrow\texttt{compute}\rightarrow\texttt{enqueue},
-\]
-\[
-    \texttt{consumer}: \quad
-    \texttt{dequeue}\rightarrow\texttt{write}\rightarrow\texttt{flush}.
-\]
-主线程充当生产者（producer），专用写线程充当消费者（consumer）。两者之间通过有界队列 $Q$ 连接：
-\[
-    0\le |Q|\le B,
-\]
-其中 $B=\max(\texttt{max\_queued\_results},1)$。
+这里有两个关键设计点。
 
-当 $C_i$ 与 $W_i$ 可以部分重叠时，端到端吞吐不再由 $C_i+W_i$ 的串行和决定，而更接近二者的较大者：
-\[
-    T_{\mathrm{steady}}
-    \approx
-    \max(\mathbb{E}[C],\mathbb{E}[W])
-    +
-    \mathbb{E}[R]
-\]
-这里的公式只是稳定阶段的近似模型，不包含首尾填充、CUDA 同步、I/O 抖动和队列等待；
-但它表达了设计动机：异步输出不是让写入消失，而是避免写入无条件占据计算线程。
+第一，线程池是全局的，而不是每个 testcase 或每次 \texttt{run()} 临时创建一组线程。
+线程创建与销毁不是免费的；更重要的是，任意阶段随手开线程会让系统并发总量失控。
+全局线程池把并发入口集中到一个对象里，至少避免了“每层都觉得自己只开一点线程”的经典灾难。
 
-\subsection{有界队列：吞吐、内存和背压的共同边界}
+第二，线程池本身只提供任务执行与 future 返回，不负责输出顺序、任务编号或 pipeline 语义。
+这让线程池保持简单：它不知道 SVD，不知道矩阵，也不知道文件。好工具应该钝一点，锋利的语义留给外层协议。
 
-\texttt{AsyncOutputStage} 的队列保存 \texttt{OutputPacket}，每个 packet 包含三张矩阵。
-因此，队列容量不是一个无关紧要的常量，而是直接决定长期内存上界。若第 $i$ 个测试用例维度为
-$m_i\times n_i$，则其输出元素数约为
-\[
-    |P_i|
-    =
-    m_i n_i + n_i + n_i^2.
-\]
-若队列允许无限增长，那么当消费者慢于生产者时，内存会随已完成但未写出的结果线性增长：
-\[
-    O\left(\sum_{i\in\mathrm{pending}} (m_i n_i+n_i+n_i^2)\right).
-\]
-这在 SVD 系统中尤其危险，因为输出规模与输入规模同阶甚至更大。
+需要诚实指出一个边界：全局线程池控制的是主机侧工作线程数量，并不自动保证 GPU kernel 真正并行执行。
+如果底层 CUDA 调用共享同一设备、默认流或全局运行时资源，多 host task 可能表现为排队、部分重叠或设备侧争用。
+因此这里的线程池应被理解为“跨 testcase 的主机任务调度器”，而不是“单个 SVD kernel 的加速器”。
+单个矩阵的数值并行性仍然来自 \texttt{kernels.cu} 内部。
 
-当前实现使用有界队列：
-\[
-    |Q| < B
-\]
-才允许生产者提交新 packet。当队列满时，生产者在 \texttt{producer\_cv} 上等待。
-这就是背压：慢速消费者通过队列容量把压力传回生产者，使系统降速而不是失控膨胀。
+\subsection{Future 窗口：把提交速度限制在可观察范围内}
 
-这种设计的系统含义很清楚：
+线程池内部队列没有显式容量上界，因此 pipeline 在外层用 \texttt{inflight} 队列控制已经提交但尚未观测的
+\texttt{future} 数量：
+\[
+    W=\max(\texttt{max\_queued\_results},1).
+\]
+每次提交一个任务后，\texttt{submit\_future} 会把 future 放入
+\texttt{std::deque<std::future<void>> inflight}。若 \texttt{inflight.size() >= W}，
+主线程立即观察队首 future：
+\[
+    \texttt{future.get()}.
+\]
+若该任务抛出异常，异常会被保存为 \texttt{first\_worker\_error}。
+
+这一点很微妙，也很重要。当前 \texttt{max\_queued\_results} 不再只是“输出队列容量”。
+它同时定义了两个窗口：
 
 \begin{itemize}
-    \item 如果写线程足够快，主线程几乎只付出一次入队成本；
-    \item 如果写线程短暂变慢，队列吸收突发抖动；
-    \item 如果写线程长期慢于计算，队列填满后主线程阻塞，系统进入受控退化；
-    \item 内存上界由 $B$ 和最大 packet 大小决定，而不是由测试用例总数决定。
+    \item 主线程允许多少个提交任务处于未观测状态；
+    \item 输出阶段允许多少个完成 packet 堆积在完成队列中。
 \end{itemize}
 
-这比“为了不阻塞就开无限队列”更有工程品味。无限队列只是把延迟伪装成内存增长；
-有界队列则承认资源有限，并把过载表现为显式等待。
+这使 CLI 中的 \texttt{--queue-capacity} 实际成为 in-flight / reorder window size。
+当 $W=1$ 时，主线程提交一个任务就等待一个任务，系统近似退化为串行 testcase 执行；
+当 $W$ 增大时，更多 testcase 可以并发解码、计算并向输出阶段提交结果。
 
-\subsection{同步协议：两个条件变量对应两个方向的等待}
+从系统控制角度看，future 窗口有三重作用：
 
-\texttt{AsyncOutputStage} 内部有一个互斥锁、一个队列、两个条件变量：
+\begin{itemize}
+    \item 防止主线程把整个输入文件一次性塞进线程池队列；
+    \item 让工作线程异常尽早回到主线程，而不是直到文件读完才发现；
+    \item 为重排序缓冲区提供间接内存上界，因为乱序完成的数量受提交窗口限制。
+\end{itemize}
+
+这比“线程池队列无限增长，最后统一 get 所有 future”稳得多。无限队列不是并发设计，它只是把背压藏了起来。
+
+\subsection{工作任务：解码、计算、提交 packet}
+
+无论输入来自 \texttt{MatDispatchTask} 还是 \texttt{io::Matrix}，线程池中的工作任务最终执行同一组动作：
 \[
-    \texttt{mutex\_},\quad
-    \texttt{queue\_},\quad
-    \texttt{consumer\_cv\_},\quad
-    \texttt{producer\_cv\_}.
+    \text{prepare Matrix}
+    \longrightarrow
+    \texttt{KernelStage::execute}
+    \longrightarrow
+    \texttt{total\_sweeps.fetch\_add}
+    \longrightarrow
+    \texttt{output.submit}.
 \]
-两个条件变量分别服务于两个互斥的等待条件：
+
+\texttt{KernelStage::execute} 先调用 \texttt{validate\_testcase\_matrix}。验证包括两类前置条件：
 \[
-    \texttt{consumer\_cv}: \quad |Q|>0 \;\lor\; \texttt{closed},
+    rows>0,\qquad columns>0,
 \]
+以及
 \[
-    \texttt{producer\_cv}: \quad |Q|<B \;\lor\; \texttt{closed} \;\lor\; \texttt{worker\_error}\ne\varnothing.
+    |\texttt{values}| = rows\cdot columns.
+\]
+乘法由 \texttt{checked\_element\_count} 做溢出检查。通过验证后，工作任务调用
+\texttt{one\_sided\_jacobi\_svd}，并将返回的 \texttt{JacobiSvdResult} 重组为
+\texttt{OutputPacket}：
+\[
+    P_i=(i,s_i,U_i,\Sigma_i,V_i).
 \]
 
-生产者提交 packet 的协议为：
-
-\begin{enumerate}
-    \item 获取互斥锁；
-    \item 等待队列未满、阶段关闭或消费者发生异常；
-    \item 若消费者异常，则在生产者线程重抛；
-    \item 若阶段已关闭，则拒绝提交；
-    \item 将 packet 移入队列；
-    \item 通知消费者。
-\end{enumerate}
-
-消费者主循环的协议为：
-
-\begin{enumerate}
-    \item 等待队列非空或关闭信号；
-    \item 若队列为空且已关闭，则退出循环；
-    \item 从队首移动出一个 packet；
-    \item 弹出队首并通知生产者；
-    \item 在锁外写出 packet。
-\end{enumerate}
-
-最后一点很关键：写文件发生在锁外。若消费者持锁执行 \texttt{write\_packet}，生产者会在整个磁盘写入期间
-无法检查队列状态，也无法观察消费者错误。当前实现只在队列操作时持锁，把高延迟 I/O 从临界区
-（critical section）中移出去。这是并发代码中非常朴素、也非常重要的好品味。
-
-\subsection{关闭协议：先停止生产，再排空队列}
-
-异步对象最容易出错的地方往往不是正常路径，而是关闭路径。当前 \texttt{AsyncOutputStage::close}
-采用两阶段协议：
+其中
 \[
-    \texttt{closed\_=true}
-    \quad\rightarrow\quad
-    \texttt{notify\_all}
-    \quad\rightarrow\quad
-    \texttt{join}
-    \quad\rightarrow\quad
-    \texttt{rethrow}.
+    U_i\in\mathbb{R}^{m_i\times n_i},\qquad
+    \Sigma_i\in\mathbb{R}^{1\times n_i},\qquad
+    V_i\in\mathbb{R}^{n_i\times n_i}.
 \]
-设置 \texttt{closed\_} 并不意味着立即丢弃队列内容。消费者被唤醒后仍会优先处理队列中已经存在的 packet；
-只有当队列为空时才退出。也就是说，关闭语义是排空式关闭（draining shutdown），而不是取消式关闭
-（cancelling shutdown）。
+\texttt{Sigma} 仍然被编码为 $1\times n$ 矩阵，而不是裸数组。这样输出阶段只处理一种对象：
+\texttt{io::Matrix}。少一个特例，就是少一个将来会咬人的分支。
 
-这一点保证了一个重要不变量：
+\texttt{total\_sweeps} 使用 \texttt{std::atomic<std::size\_t>} 累加，并采用
+\texttt{memory\_order\_relaxed}。这是合理的：这里没有用 sweep 总数同步其他内存状态，
+只需要最终数值求和。用更强内存序不会让报告更正确，只会表达不存在的同步语义。
+
+\subsection{输出阶段：完成队列不是最终顺序}
+
+多线程计算带来一个直接后果：第 $i+1$ 个 testcase 可能先于第 $i$ 个完成。如果直接按完成顺序写文件，
+输出流就会变成：
 \[
-    \text{若 } \texttt{submit}(P_i) \text{ 成功返回，且随后 } \texttt{close()} \text{ 未抛出异常，}
-    \text{则 } P_i \text{ 已被提交给输出流。}
+    (U_{\pi(0)},\Sigma_{\pi(0)},V_{\pi(0)}),
+    (U_{\pi(1)},\Sigma_{\pi(1)},V_{\pi(1)}),
+    \ldots
 \]
-实际持久化仍依赖 \texttt{ResultWriter::flush} 与底层文件系统语义，但 pipeline 层至少保证了
-packet 不会在关闭过程中被静默丢弃。
+其中 $\pi$ 是某个由调度、矩阵规模、GPU 状态和 I/O 抖动共同决定的排列。
+这对下游读取器很糟糕：同一输入文件多跑几次，输出顺序可能不同，实验结果也更难复现。
 
-析构函数调用 \texttt{close\_noexcept}。这是 RAII（Resource Acquisition Is Initialization）
-语义在并发对象上的体现：即使调用者因为异常离开作用域，消费者线程也会被请求关闭并 join。
-析构函数吞掉异常是必要的，因为 C++ 析构函数不应在栈展开期间继续抛出；真正需要向调用者报告错误的路径是显式
-\texttt{close()}。
-
-\subsection{异常传播：跨线程失败不能静默消失}
-
-写线程中的异常无法直接穿透到主线程调用栈。因此 \texttt{AsyncOutputStage} 使用
-\texttt{std::exception\_ptr worker\_error\_} 保存消费者异常。消费者捕获任意异常后执行：
+\texttt{ReorderBufferOutputStage} 正是为了解决这个问题。它内部有两个不同的结构：
 \[
-    \texttt{worker\_error\_} \leftarrow \texttt{current\_exception},
+    Q_c=\texttt{completed\_queue\_},
     \qquad
-    \texttt{closed\_} \leftarrow \texttt{true},
-    \qquad
-    \texttt{notify\_all}.
+    B=\texttt{reorder\_buffer\_}.
 \]
-随后，生产者在下一次 \texttt{submit} 等待返回时会调用 \texttt{rethrow\_worker\_error\_locked}，
-显式重抛该异常；若没有后续 submit，\texttt{close()} 在 join 后也会重抛。
+\texttt{completed\_queue\_} 是工作线程提交完成 packet 的有界 FIFO；
+\texttt{reorder\_buffer\_} 是写线程私有的
+\texttt{unordered\_map<std::size\_t, OutputPacket>}，按 testcase index 暂存乱序结果。
 
-这建立了清晰的故障传播路径：
+工作线程调用 \texttt{submit(packet)} 时，只进入完成队列：
 \[
-    \text{consumer failure}
-    \longrightarrow
-    \texttt{worker\_error\_}
-    \longrightarrow
-    \text{producer observes}
-    \longrightarrow
-    \text{pipeline run fails}.
+    P_i \longrightarrow Q_c.
 \]
-没有这个路径，写线程可能已经失败，而主线程仍继续计算并报告成功。那会比直接崩溃更糟糕：
-它制造了一个看似完整、实则缺失输出的实验结果。系统代码中，静默数据丢失通常比显式失败更危险。
-
-\subsection{输出顺序：单消费者保持确定性}
-
-\texttt{ResultWriter::write\_packet} 对每个测试用例按固定顺序写出三张矩阵：
+写线程从完成队列中取出 packet 后，插入重排序缓冲区：
 \[
-    U_i,\quad \Sigma_i,\quad V_i.
+    Q_c.front()=P_j
+    \longrightarrow
+    B[j]=P_j.
 \]
-由于当前输出阶段只有一个消费者线程，且队列是 FIFO，输出文件顺序为：
+随后调用 \texttt{flush\_ready\_packets}，只要缓冲区中存在
+\texttt{next\_expected\_index\_}，就连续写出：
+\[
+    B[k]\rightarrow output,\quad k=\texttt{next\_expected\_index\_}.
+\]
+写完后删除该项，并令
+\[
+    \texttt{next\_expected\_index\_}\leftarrow
+    \texttt{next\_expected\_index\_}+1.
+\]
+
+这个结构把“完成顺序”和“文件顺序”解耦了。完成队列吸收并发计算的结果；重排序缓冲区恢复输入序。
+输出文件仍保持稳定契约：
 \[
     (U_0,\Sigma_0,V_0),
     (U_1,\Sigma_1,V_1),
     \ldots,
     (U_{N-1},\Sigma_{N-1},V_{N-1}).
 \]
-这给下游读取器提供了非常简单的契约：每三个矩阵组成一个测试用例的完整 SVD 结果。
 
-为什么不使用多个写线程？对于单个顺序输出文件，多消费者通常会引入额外复杂度：必须维护全局序号、
-处理乱序完成、合并写入、同步文件偏移，甚至需要为文本格式维护矩阵间分隔。当前系统的写入瓶颈不应首先用
-“更多线程”解决，而应先保持单消费者的顺序确定性。若未来输出成为主要瓶颈，更自然的演化方向是按测试用例拆分输出文件、
-使用批量缓冲，或让二进制 writer 预估容量并减少重映射，而不是让多个线程争用同一个顺序流。
+\subsection{完成队列背压：慢写线程不能让内存无界膨胀}
 
-\subsection{执行报告：把可观测性限制在稳定指标上}
-
-\texttt{PipelineReport} 返回三个指标：
+\texttt{ReorderBufferOutputStage::submit} 使用
 \[
-    \texttt{testcase\_count},\quad
-    \texttt{emitted\_matrix\_count},\quad
-    \texttt{total\_sweeps}.
+    \texttt{queue\_capacity\_}=\max(\texttt{max\_queued\_results},1)
 \]
-其中 \texttt{emitted\_matrix\_count} 每处理一个测试用例增加 $3$，对应 $U,\Sigma,V$；
-\texttt{total\_sweeps} 汇总所有测试用例的迭代轮数。
-
-这些指标刻意保持朴素。它们不暴露队列长度时间序列、每例耗时、I/O 字节数或 GPU kernel 细节。
-在当前项目阶段，这是合理取舍：报告对象作为稳定 API，只包含不易随实现变化而失效的语义指标。
-更细粒度的性能观测应当进入 profiling 或 tracing 机制，而不是塞进基础返回结构。
-
-\subsection{内存模型：长期驻留与瞬时驻留}
-
-pipeline 的长期内存驻留可拆为三部分：
+作为完成队列容量。工作线程提交结果时等待：
 \[
-    M_{\mathrm{live}}
+    |Q_c|<\texttt{queue\_capacity\_}
+    \quad\lor\quad
+    \texttt{closed\_}
+    \quad\lor\quad
+    \texttt{worker\_error\_}\ne\varnothing.
+\]
+若写线程已经记录异常，提交线程会立即重抛；若输出阶段已经关闭，则提交失败；否则 packet 被移动进队列。
+
+这里的背压（backpressure）方向与旧版单生产者模型不同。现在生产者不是主线程，而是多个工作线程。
+当写线程跟不上时，完成队列填满，工作线程会阻塞在 \texttt{submit} 上。随后主线程通过 future 窗口
+观察到任务尚未完成，也会停止继续提交更多输入任务。压力沿着如下链条回传：
+\[
+    \text{slow writer}
+    \rightarrow
+    Q_c \text{ full}
+    \rightarrow
+    \text{worker blocked in submit}
+    \rightarrow
+    \text{future not ready}
+    \rightarrow
+    \text{main dispatch blocked}.
+\]
+
+这条链条很有价值。系统不会因为写出慢而无限堆积
+\[
+    U_i,\Sigma_i,V_i
+\]
+这些大对象。对 SVD 而言，单个 packet 的元素数量约为
+\[
+    m_i n_i+n_i+n_i^2,
+\]
+其中 $V_i$ 的 $n_i^2$ 项可能非常大。没有背压的异步输出，本质上是在用内存给慢 I/O 借高利贷。
+
+\subsection{重排序缓冲区的内存上界}
+
+重排序缓冲区本身不是显式有界队列。写线程一旦从完成队列中取出 packet，就会把它放入
+\texttt{reorder\_buffer\_}。如果最早缺失的 testcase 很慢，后续完成的 packet 会暂存在缓冲区中。
+这看起来像一个潜在风险，但当前实现用 future 窗口给它提供了间接上界。
+
+设窗口大小为 $W$。主线程不会无限领先于最早未完成任务；一旦 \texttt{inflight.size() >= W}，
+它会等待队首 future。因此，在第 $k$ 个任务迟迟未完成时，最多只有一个有限窗口内的后续任务能够先完成并进入
+重排序缓冲区。于是长期驻留不再由输入总数 $N$ 决定，而由窗口与单包大小决定：
+\[
+    M_{\mathrm{pending}}
     =
-    M_{\mathrm{input}}
-    +
-    M_{\mathrm{current\ result}}
-    +
-    M_{\mathrm{queue}}.
+    O(W\cdot E_{\max}),
 \]
-主循环每次只持有当前输入矩阵 \texttt{testcase}，计算完成后得到一个 \texttt{OutputPacket}，
-再通过移动语义提交给队列。由于 \texttt{OutputPacket} 内部的 \texttt{std::vector<double>} 被移动，
-入队不会复制完整数值载荷。
-
-设队列容量为 $B$，单个结果 packet 的最大元素数为 $E_{\max}$，则队列部分的内存上界为
+其中
 \[
-    O(BE_{\max}).
+    E_{\max}
+    =
+    \max_i(m_i n_i+n_i+n_i^2).
 \]
-这并不意味着峰值内存很小：如果 $B$ 过大，或者 $n$ 较大导致 $V\in\mathbb{R}^{n\times n}$ 占主导，
-队列仍可能持有大量输出。但上界至少由配置显式控制，而不是由输入文件中测试用例数量隐式决定。
 
-从 Linus 式的朴素标准看，这正是该设计最有价值的地方：不要发明一个看起来很灵活、实际会在压力下无界膨胀的结构。
-有界队列是一种承认现实资源限制的接口。
+这个结论不是说内存一定小。若 $W$ 很大，或者矩阵列数 $n$ 很大，$V$ 仍然会主导内存。
+但至少资源上界被暴露为用户可调参数，而不是隐藏在输入文件长度里。Linus 式地说，别把“可以跑”
+建立在“希望用户别喂太多数据”上。窗口就是把这个希望变成约束的地方。
+
+\subsection{写线程协议：单线程持有 writer，锁外执行 I/O}
+
+\texttt{ReorderBufferOutputStage} 构造时启动一个写线程：
+\[
+    \texttt{consumer\_thread\_}
+    =
+    \texttt{thread}(\texttt{consumer\_main}).
+\]
+写线程先调用 \texttt{ensure\_output\_directory}，再构造 \texttt{ResultWriter}。
+这意味着输出目录创建与底层输出流打开都发生在写线程内部；若失败，异常会进入
+\texttt{worker\_error\_}，再被提交线程或关闭路径观察到。
+
+写线程主循环可以概括为：
+
+\begin{enumerate}
+    \item 等待完成队列非空、关闭或中止；
+    \item 若队列非空，移动出一个 packet，弹出队首，并通知生产者；
+    \item 释放互斥锁；
+    \item 将 packet 插入重排序缓冲区；
+    \item 尝试按序写出所有连续 packet；
+    \item 关闭时再尝试 flush 一次，最后调用 writer 的 \texttt{flush()}。
+\end{enumerate}
+
+注意第三步。文件写入不发生在 \texttt{mutex\_} 保护的临界区（critical section）内。
+互斥锁只保护完成队列、关闭标志和异常指针；真正的 I/O 在锁外执行。否则一个慢速
+\texttt{write\_packet} 会阻塞所有工作线程对完成队列状态的检查，甚至放大成全局停顿。
+并发代码里的好设计往往就长这样：不是更复杂，而是把慢操作从锁里拿出去。
+
+\texttt{ResultWriter::write\_packet} 对每个 packet 固定写三张矩阵：
+\[
+    U_i,\quad \Sigma_i,\quad V_i.
+\]
+因此输出顺序有两层确定性：testcase 之间按 index 递增；单个 testcase 内部按
+$U/\Sigma/V$ 固定顺序写出。
+
+\subsection{关闭协议：成功路径检查完整性，错误路径快速中止}
+
+旧版异步输出只需要“排空队列然后 join”。新版因为有并发计算和重排序缓冲区，关闭语义更严格。
+
+\paragraph{成功路径。}
+主线程读完整个输入、观察完所有 future，且没有记录工作线程异常后，调用
+\[
+    \texttt{output.close\_success(submitted\_count)}.
+\]
+该函数设置：
+\[
+    \texttt{expected\_count\_}=\texttt{submitted\_count},\qquad
+    \texttt{closed\_}=true.
+\]
+然后唤醒写线程并 \texttt{join}。写线程退出前会把完成队列与重排序缓冲区中所有连续 packet 写出。
+\texttt{join} 后，成功路径还检查：
+\[
+    \texttt{written\_count\_}=\texttt{expected\_count\_}.
+\]
+若不相等，说明存在缺失 packet，例如某个 index 永远没有抵达，重排序缓冲区无法越过这个空洞。
+此时抛出 \texttt{Output reorder stage finished with missing packets.}
+
+这条检查非常关键。没有它，系统可能在缺少某个 testcase 输出时仍然 flush 文件并报告成功。
+对数值实验而言，静默缺失比崩溃更坏，因为它会污染后续分析。
+
+\paragraph{错误路径。}
+若任意 worker future 抛出，或主线程读输入时抛出，pipeline 调用
+\[
+    \texttt{output.close\_error(exception)}.
+\]
+它设置 \texttt{worker\_error\_}、\texttt{closed\_} 与 \texttt{abort\_}，
+唤醒所有等待者，然后 join 写线程并重抛记录的异常。写线程看到 \texttt{abort\_} 后会退出，
+不再承诺排空所有结果。
+
+这就是 fail-fast 语义：一旦输入、解码、kernel 或输出任一阶段失败，本次 pipeline 不再伪装成部分成功。
+如果未来要支持“跳过坏 testcase 继续跑”，那必须重新定义输出格式、报告字段和错误聚合语义。
+当前实现选择简单、强硬、可审计的失败模型。
+
+析构函数调用 \texttt{close\_noexcept}，作为 RAII（Resource Acquisition Is Initialization）兜底。
+它吞掉异常，因为 C++ 析构函数不能在栈展开期间继续抛出。真正向调用者报告错误的路径是显式
+\texttt{close\_success} 或 \texttt{close\_error}。
+
+\subsection{异常传播：future 与 writer error 两条通道}
+
+当前实现有两类跨线程异常。
+
+\paragraph{工作任务异常。}
+解码失败、矩阵验证失败、CUDA kernel 抛错、\texttt{output.submit} 抛错，都会使
+\texttt{packaged\_task} 对应的 future 进入异常状态。主线程通过
+\texttt{observe\_future} 调用 \texttt{future.get()}，并将第一个异常保存为
+\texttt{first\_worker\_error}。
+
+\paragraph{写线程异常。}
+输出目录创建失败、输出流构造失败、写矩阵失败、flush 失败、重复 testcase index 等异常，
+发生在写线程内部，无法直接穿透到主线程调用栈。写线程捕获所有异常后保存到
+\texttt{worker\_error\_}，并设置关闭与中止标志：
+\[
+    \texttt{worker\_error\_}\leftarrow\texttt{current\_exception},
+    \quad
+    \texttt{closed\_}\leftarrow true,
+    \quad
+    \texttt{abort\_}\leftarrow true.
+\]
+随后所有等待在 \texttt{submit} 上的工作线程都会被唤醒，并在
+\texttt{rethrow\_worker\_error\_locked} 中重抛写线程异常。
+
+因此，错误传播路径可以写成：
+\[
+    \begin{aligned}
+        \text{worker failure}
+         & \rightarrow
+        \texttt{future}
+        \rightarrow
+        \texttt{first\_worker\_error}
+        \rightarrow
+        \texttt{run fails}, \\
+        \text{writer failure}
+         & \rightarrow
+        \texttt{worker\_error\_}
+        \rightarrow
+        \texttt{submit/close rethrows}
+        \rightarrow
+        \texttt{run fails}.
+    \end{aligned}
+\]
+
+这两条通道共同保证一个性质：只要某个线程认为本次输出不可信，最终 \texttt{run()} 就不能报告成功。
 
 \subsection{正确性不变量}
 
-可以把 \texttt{JacobiSvdPipeline::run} 的行为描述为如下状态转移。令输入流产生矩阵序列
-$X_0,\ldots,X_{N-1}$，且每个 $X_i$ 通过验证。若 kernel 与输出阶段均不抛出异常，则 pipeline 返回报告
+令输入流产生矩阵序列
+\[
+    X_0,X_1,\ldots,X_{N-1}.
+\]
+若所有输入均合法，kernel 与输出阶段均不抛出异常，则 pipeline 返回报告：
 \[
     \texttt{testcase\_count}=N,
     \qquad
@@ -393,111 +512,187 @@ $X_0,\ldots,X_{N-1}$，且每个 $X_i$ 通过验证。若 kernel 与输出阶段
     \qquad
     \texttt{total\_sweeps}=\sum_{i=0}^{N-1}s_i.
 \]
-输出流包含序列
+输出流包含：
 \[
     U_0,\Sigma_0,V_0,\ldots,U_{N-1},\Sigma_{N-1},V_{N-1}.
 \]
 
-这一性质依赖几个局部不变量：
+这一性质依赖以下局部不变量：
 
 \begin{itemize}
-    \item 输入阶段每次成功读取恰好产生一张矩阵；
-    \item 计算阶段对每张输入矩阵恰好产生一个 \texttt{OutputPacket}；
-    \item 每个 \texttt{OutputPacket} 恰好写出三张矩阵；
-    \item 队列 FIFO 顺序与单消费者保证输出顺序等于提交顺序；
-    \item \texttt{close()} 在返回前等待消费者线程结束；
-    \item 消费者异常最终在生产者线程或 close 路径中被重抛。
+    \item 输入派发为每个 testcase 分配唯一且单调递增的 \texttt{testcase\_index}；
+    \item 每个成功工作任务恰好产生一个 \texttt{OutputPacket}；
+    \item \texttt{OutputPacket} 的 index 不在输出阶段被修改；
+    \item 完成队列只影响抵达顺序，不定义文件顺序；
+    \item 重排序缓冲区只在存在 \texttt{next\_expected\_index\_} 时写出；
+    \item 每个 packet 写出时固定产生三张矩阵；
+    \item 成功关闭后 \texttt{written\_count\_} 必须等于提交总数；
+    \item 任意线程异常最终会通过 future 或 \texttt{worker\_error\_} 回到主线程。
 \end{itemize}
 
-这些不变量没有依赖复杂同步技巧。相反，它们来自非常保守的结构：一个生产者、一个消费者、一个有界 FIFO、
-一个关闭标志、一个异常指针。并发代码越是靠少数清晰状态表达，越容易审计。
+这些不变量没有依赖玄学调度。它们来自几个朴素状态：序号、future 窗口、完成队列、重排序 map、
+下一个期望 index、异常指针。并发代码最好的状态就是少到可以数清楚。
 
-\subsection{性能模型：重叠而不是加速单个阶段}
+\subsection{内存模型：输入任务、计算结果与乱序窗口}
 
-生产者-消费者 pipeline 常被误解为“让程序自动变快”。更准确地说，它不加速单个 SVD，也不降低单次写入成本；
-它只允许计算阶段与写出阶段在不同线程上重叠。若计算远慢于写出：
+当前 pipeline 的长期内存驻留可拆成四部分：
 \[
-    C \gg W,
+    M_{\mathrm{live}}
+    =
+    M_{\mathrm{reader}}
+    +
+    M_{\mathrm{inflight}}
+    +
+    M_{\mathrm{completed}}
+    +
+    M_{\mathrm{reorder}}.
 \]
-异步输出带来的收益很小，因为写线程大部分时间在等待。若写出远慢于计算：
-\[
-    W \gg C,
-\]
-队列很快填满，生产者被背压阻塞，稳定吞吐仍由写出决定。收益最大的区域是二者同阶且存在抖动：
-\[
-    C \approx W,
-\]
-队列可以吸收短期波动，并让 CPU/GPU 计算与文件系统写入更少相互等待。
 
-因此，本设计的性能收益不是一个固定常数，而取决于矩阵规模、SVD sweep 数、输出格式、存储设备、
-操作系统页缓存状态以及 \texttt{max\_queued\_results}。对于文本输出，\texttt{W} 可能包含大量格式化成本；
-对于二进制 \texttt{*.mat} 输出，\texttt{W} 更多由内存拷贝、端序转换、映射扩容和 flush 决定。
+\paragraph{Reader 驻留。}
+\texttt{*.mat} 路径中，主线程复用 \texttt{MatDispatchTask}，每次读取后把任务移动给 worker，
+再重置本地任务对象。任务底层可能持有 pinned buffer。pinned memory 不是普通堆内存；
+它会降低操作系统调页自由度，因此必须通过 in-flight 窗口控制同时存在的任务数。
 
-这也解释了为什么队列容量应作为配置暴露。小容量提供更紧的内存上界，大容量提供更强的抖动吸收能力。
-没有一个容量对所有机器、所有矩阵规模都最优。系统接口应当暴露这个真实取舍，而不是把它埋成不可调常量。
+\paragraph{In-flight 驻留。}
+每个已提交但未完成的任务可能持有原始 payload、解码后的 \texttt{io::Matrix}、kernel 输出的
+\texttt{OutputPacket}，或者正阻塞在 \texttt{output.submit} 上。其数量由 future 窗口控制。
+
+\paragraph{Completed queue 驻留。}
+完成队列中保存已经计算完、尚未被写线程取走的 \texttt{OutputPacket}。它有显式容量上界
+\texttt{queue\_capacity\_}。
+
+\paragraph{Reorder buffer 驻留。}
+重排序缓冲区保存已经被写线程取走、但因为前序 index 缺失而暂时不能写出的 packet。
+它的上界来自 future 提交窗口，而不是自身容量字段。
+
+因此，在矩阵规模峰值为 $E_{\max}$、窗口大小为 $W$ 的粗略模型下，结果类对象的驻留上界为：
+\[
+    O(W\cdot E_{\max}).
+\]
+这只是结构上界，不包含 CUDA runtime 内部缓存、设备内存、文件系统页缓存和 \texttt{std::vector}
+capacity 余量。系统文档需要诚实：抽象模型帮助理解压力来源，但不是精确内存 profiler。
+
+\subsection{性能模型：跨 testcase 重叠，而不是魔法加速}
+
+设第 $i$ 个 testcase 的主要耗时为：
+\[
+    R_i=\text{读取/派发},\quad
+    D_i=\text{解码},\quad
+    C_i=\text{SVD 计算},\quad
+    W_i=\text{写出}.
+\]
+旧的串行模型近似为：
+\[
+    T_i=R_i+D_i+C_i+W_i.
+\]
+新的 pipeline 允许不同 testcase 的 $D_i+C_i$ 在全局线程池中重叠，并允许写出与后续计算重叠。
+稳定阶段吞吐更接近：
+\[
+    T_{\mathrm{steady}}
+    \approx
+    \max(
+    T_{\mathrm{dispatch}},
+    T_{\mathrm{thread\ pool}},
+    T_{\mathrm{writer}}
+    ),
+\]
+再加上窗口等待、CUDA 同步、I/O 抖动和首尾填充等成本。
+
+这不是说程序一定线性加速。收益取决于几个现实因素：
+
+\begin{itemize}
+    \item 单个 SVD 是否已经足够占满 GPU；
+    \item 多个 host 线程提交 CUDA 工作时是否发生设备侧排队；
+    \item \texttt{*.mat} 解码成本与 kernel 成本的比例；
+    \item 输出格式是二进制还是文本；
+    \item \texttt{--queue-capacity} 是否足够吸收抖动；
+    \item 矩阵规模是否高度不均匀，导致重排序缓冲区等待慢任务。
+\end{itemize}
+
+所以，全局线程池的意义不是“让单个矩阵的 SVD 更快”。单个 SVD 的速度仍由 CUDA kernel、
+布局转置策略、线程块配置和内存访问决定。pipeline 并发优化的是跨 testcase 的吞吐与端到端资源组织。
+如果输入文件只有一张大矩阵，线程池几乎不能提供吞吐优势；如果有许多中等规模矩阵，线程池与重排序缓冲区才更有空间。
+
+\subsection{为什么不用多个 writer}
+
+看到全局线程池后，一个自然问题是：为什么输出不也开多个写线程？答案很简单：当前输出目标是单个顺序矩阵流。
+对这种文件而言，多 writer 不会自动提高确定性，反而会引入文件偏移同步、文本分隔、二进制记录边界、
+flush 顺序和错误恢复问题。
+
+现在的结构只让一个写线程持有 \texttt{ResultWriter}。它用重排序缓冲区把并发计算的乱序性吸收掉，
+再以单一顺序流写出。这样下游契约最简单：
+\[
+    \text{每三个矩阵组成一个 testcase 的 } U,\Sigma,V.
+\]
+
+如果未来写出成为主要瓶颈，更自然的演化方向不是多个线程争抢同一个顺序文件，而是：
+\begin{itemize}
+    \item 按 testcase 拆分输出文件；
+    \item 二进制输出预估总容量并减少重映射；
+    \item 增加批量编码缓冲；
+    \item 或定义带索引的分块输出格式。
+\end{itemize}
+这些方案都需要新的文件格式契约。当前单 writer 是简单且正确的默认选择。
 
 \subsection{当前实现的边界与可演化方向}
 
-当前 \texttt{pipeline.cpp} 已经建立了清晰的应用层骨架，但仍有若干边界值得明确记录。
+\paragraph{第一，线程池大小暂时不是 pipeline 配置。}
+线程池大小由硬件并发数决定，CLI 暴露的是 in-flight / reorder 窗口，而不是 worker 数。
+这降低了用户配置表面积，但也意味着不能直接限制主机 worker 数。若未来 profiling 证明需要，
+可以把线程池大小变成进程级配置；不过要小心，全局对象一旦初始化，运行期再改大小就会牵涉生命周期语义。
 
-\paragraph{第一，输入与计算仍在同一生产者线程中。}
-当前主线程顺序执行 \texttt{read\_next} 与 kernel 调用。由于二进制输入使用内存映射，
-读取路径主要是解码和构造 \texttt{std::vector<double>}；在多数 dense SVD 场景中，计算成本通常更大。
-但若未来输入解码或网络存储成为瓶颈，可以引入第二个有界队列，把输入解码也异步化：
+\paragraph{第二，线程池队列本身没有容量上界。}
+当前上界来自 pipeline 的 future 窗口，而不是线程池内部。只要所有任务都通过
+\texttt{JacobiSvdPipeline::run} 提交，这个外层约束是有效的。若未来其他模块也复用全局线程池，
+就需要重新考虑池内队列容量、优先级或独立 executor。
+
+\paragraph{第三，CUDA stream 级重叠尚未显式建模。}
+当前工作任务调用同步风格的 \texttt{one\_sided\_jacobi\_svd}。即使多个 host 线程并发调用，
+也不等价于精心设计的
 \[
-    \texttt{reader}
-    \rightarrow
-    Q_{in}
-    \rightarrow
-    \texttt{compute}
-    \rightarrow
-    Q_{out}
-    \rightarrow
-    \texttt{writer}.
+    \text{host decode}
+    \parallel
+    \text{host-device copy}
+    \parallel
+    \text{kernel}
+    \parallel
+    \text{device-host copy}
 \]
-这会增加状态空间，因此只有在 profiling 证明必要时才值得做。
+流水线。要真正做到 stream 级重叠，需要 kernel 层暴露异步接口、显式 stream、事件和 pinned staging
+生命周期。这不应在 pipeline 层偷偷完成。
 
-\paragraph{第二，GPU 计算没有使用多 CUDA stream 重叠。}
-当前 pipeline 的异步性发生在 CPU 写线程与主线程之间，而不是 CUDA stream（CUDA stream）层面的
-host-device copy、kernel 与 device-host copy 重叠。若后续要追求更高吞吐，需要把
-\texttt{one\_sided\_jacobi\_svd} 内部改造成可外部调度的异步接口，并显式管理 pinned memory
-（page-locked memory）与 stream 生命周期。这会显著改变 kernel 层契约，不应在应用层偷偷完成。
+\paragraph{第四，文本输入仍在主线程解析。}
+这对小规模可读测试是合理的。若文本输入成为瓶颈，可以把文本解析也变成任务；但那会让错误位置、
+行号报告和输入游标协议更复杂。当前项目的高吞吐路径应优先使用 \texttt{*.mat}。
 
-\paragraph{第三，输出队列以完整 SVD 结果为粒度。}
-这保持了实现简单和顺序确定性，但也意味着一个 packet 可能很大，特别是 $V$ 的 $O(n^2)$ 存储。
-如果未来输出矩阵极大，可以考虑把 \texttt{U}、\texttt{Sigma}、\texttt{V} 分别作为更小的输出任务。
-不过那会削弱“每个 testcase 一个 packet”的原子性，需要额外协议保证三者完整性。
+\paragraph{第五，重排序缓冲区保证顺序，不保证恢复。}
+一旦某个 index 缺失，成功关闭会检测到 \texttt{written\_count\_ != expected\_count\_} 并失败。
+它不会尝试跳过缺口继续写后续结果。这个选择符合当前实验工具的 fail-fast 语义。
 
-\paragraph{第四，错误恢复策略是 fail-fast。}
-一旦输入、kernel 或输出阶段抛出异常，pipeline 终止。这对数值实验工具是合理默认：
-畸形输入或不完整输出不应被悄悄跳过。若未来面向批量服务场景，可以增加“记录失败并继续”的模式，
-但那需要显式定义部分成功输出的文件格式与报告语义。
-
-\paragraph{第五，报告仍缺少性能遥测。}
-当前报告足以描述语义结果，但不足以分析吞吐瓶颈。后续可以加入非侵入式计时：
-\[
-    T_{read},\quad T_{compute},\quad T_{enqueue\ wait},\quad T_{write},\quad T_{flush}.
-\]
-这些指标最好进入独立 profiling 结构，避免污染稳定 API。
+\paragraph{第六，报告仍是语义报告，不是性能遥测。}
+\texttt{PipelineReport} 现在包含 testcase 数、写出矩阵数、总 sweep、布局转置模式与调优结果。
+它没有暴露每阶段耗时、队列等待时间、重排序缓冲区峰值或 future 窗口阻塞次数。若要分析吞吐瓶颈，
+建议新增独立 profiling 结构，而不是把稳定报告对象变成调试日志。
 
 \subsection{小结}
 
-\texttt{pipeline.cpp} 的设计可以概括为一种保守的结构：
+当前 \texttt{pipeline.cpp} 的结构可以概括为一句话：
 
 \begin{quote}
-    用矩阵流定义输入边界，用 kernel stage 定义计算边界，用有界 FIFO 定义计算与输出之间的并发边界，
-    用 RAII 和异常传播定义生命周期与失败边界。
+    主线程顺序派发带序号任务，全局线程池并发执行 testcase，输出阶段用完成队列吸收结果，
+    再用重排序缓冲区恢复输入顺序，最后由单 writer 写出稳定矩阵流。
 \end{quote}
 
-它没有试图把所有阶段都做成完全异步，也没有引入复杂调度器。相反，它选择了一个最小而有效的并发点：
-SVD 结果已经完整产生、可以与后续计算解耦，而写入又可能因文件系统产生不可预测延迟。
-在这里放置一个有界生产者-消费者队列，既能重叠计算和写出，又能用背压控制内存。
+这个设计把并发引入在最有价值的位置：跨 testcase 的解码与 SVD 可以并行，慢速输出可以通过队列背压表达真实成本，
+乱序完成不会破坏文件契约，任何线程失败最终都会回到 \texttt{run()}。同时，它没有把系统推进到过度复杂：
+没有每个阶段随手开线程，没有多个 writer 争抢顺序文件，也没有把 CUDA stream 生命周期藏进应用层。
 
-从更高层看，整个项目的分层由此闭合：\texttt{io.cpp} 给出可靠的数据平面，
-\texttt{kernels.cu} 给出数值计算平面，\texttt{pipeline.cpp} 给出应用调度平面。
-每一层都保持自己的抽象边界，不向相邻层泄漏过多机制。这样的代码不一定是最短的，
-但它更容易被证明、被测试、被扩展，也更不容易在规模增长时暴露出隐式耦合。
+从更高层看，整个项目的分层由此更清楚了。\texttt{io.cpp} 给出矩阵流与 pinned dispatch task，
+\texttt{kernels.cu} 给出单矩阵数值计算，\texttt{pipeline.cpp} 给出跨 testcase 的应用调度。
+每一层都只向外暴露必要的契约。这样的代码不一定最短，但它更容易被证明、被测试、被扩展，
+也更不容易在压力下表现出隐藏的无界资源增长。
 
-这就是本章的重点：生产者-消费者并不是并发教科书里的装饰模式，而是这个 SVD 系统中连接数值吞吐、
-文件持久化和资源上界的关键结构。它让慢速外设通过背压表达真实代价，让计算路径尽可能保持前进，
-同时保证任何失败最终都会回到调用者面前。对一个数值系统而言，这种诚实的边界感，比盲目追求异步更重要。
+这就是本章的重点：全局线程池与重排序缓冲区不是并发装饰品，而是 pipeline 聚合根的骨架。
+它们共同回答了一个系统问题：当输入是有序的、计算是并发的、完成是乱序的、输出又必须有序时，
+我们如何既保持吞吐，又不牺牲确定性与错误诚实性。当前实现给出的答案是保守的，但正因为保守，
+它才适合成为这个 CUDA 数值系统的应用层根对象。

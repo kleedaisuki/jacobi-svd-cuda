@@ -1,23 +1,36 @@
 \section{CLI 表示层：从用户意图到 Pipeline 契约}
 
-前一章讨论了 \texttt{pipeline.cpp} 如何把输入流、CUDA kernel 与异步输出组织成应用层聚合根
-（aggregate root）。本章继续上移一层，聚焦 \texttt{main.cpp}：它是命令行接口
-（command-line interface, CLI）的表示层（presentation layer），负责把用户输入的字符串序列
+前一章讨论了 \texttt{pipeline.cpp} 如何把顺序输入、全局线程池、重排序缓冲区和单 writer
+组织成应用层聚合根（aggregate root）。本章继续向外走一层，聚焦
+\texttt{main.cpp}：它是命令行接口（command-line interface, CLI）的表示层
+（presentation layer），负责把用户输入的字符串序列
 \[
-    argv = (a_0,a_1,\ldots,a_{n-1})
+    argv=(a_0,a_1,\ldots,a_{n-1})
 \]
-转化为类型化、验证过、可执行的 \texttt{PipelineConfig}。
+编译成可执行的应用层契约。
 
-这层代码不应被看作“杂项入口函数”。在数值系统中，CLI 是用户、实验脚本、构建系统和应用内核之间的第一个协议边界。
-若该边界含糊，错误就会从命令行漂移到 I/O、pipeline 甚至 GPU kernel 中；若该边界清晰，系统就能在进入昂贵计算之前
-完成语法检查（syntax checking）、语义检查（semantic checking）、默认值归一化（default normalization）
-和故障分类（failure classification）。因此，\texttt{main.cpp} 的核心任务不是“启动程序”，而是定义一个小型命令语言
-（command language）及其到应用层配置的可证明映射。
+这一章需要注意一个更新后的事实：当前 \texttt{main.cpp} 已经不再只是“读两个文件名然后启动
+pipeline”的薄入口。它现在承担了更完整的用户协议：格式推断、默认输出路径生成、覆盖保护、dry-run
+配置展示、布局转置策略（layout-transpose policy）、布局阈值自动调优
+（threshold auto-tuning）、文本/JSON 双报告，以及清晰的退出码分类。换言之，CLI 层已经成为
+\[
+    \text{user intent}
+    \longrightarrow
+    \texttt{CliOptions}
+    \longrightarrow
+    \texttt{PipelineConfig}
+\]
+这条路径上的第一个强类型边界。
 
-\subsection{层次定位：表示层只拥有意图，不拥有算法}
+在数值程序里，这个边界一点也不“外围”。若 CLI 模糊，错误就会漂移到文件流、pipeline、CUDA runtime
+甚至数值 kernel 中；若 CLI 清楚，系统可以在进入昂贵的 I/O 与 GPU 计算之前完成语法检查
+（syntax checking）、语义检查（semantic checking）、默认值归一化（default normalization）、
+资源保护和失败分类。因此，\texttt{main.cpp} 的核心任务不是“启动程序”，而是定义一个小型命令语言
+（command language），并把它降阶为 pipeline 能理解的最小配置。
 
-\texttt{main.cpp} 位于项目的最外层。它只面向应用层入口；I/O 与 CUDA kernel 的实现细节留在更低层。
-若将整个系统抽象为四层：
+\subsection{层次定位：表示层只拥有用户意图}
+
+当前系统可以按如下依赖方向理解：
 \[
     \text{CLI}
     \longrightarrow
@@ -25,308 +38,478 @@
     \longrightarrow
     \{\text{I/O},\text{Kernel}\}
     \longrightarrow
-    \text{OS / CUDA Runtime},
+    \text{OS / CUDA Runtime}.
 \]
-则 CLI 层只负责第一条箭头：
-\[
-    \mathcal{C}: argv \mapsto (action, options).
-\]
-这里的 \texttt{action} 决定程序是否执行、输出帮助或输出版本；\texttt{options} 则在执行路径上进一步映射为
-\texttt{PipelineConfig}。这种分离避免了一个常见坏味道：把命令行选项直接散落在计算代码中，使 kernel 参数、
-文件格式、输出报告和错误提示互相耦合。
+CLI 层只拥有第一条箭头。它知道用户写了哪些选项、哪些路径、哪些数值参数；它不知道
+\texttt{*.mat} 的内存映射细节，不知道 Givens 旋转如何在 GPU 上执行，也不知道输出线程如何用重排序缓冲区恢复顺序。
 
-从职责边界看，\texttt{main.cpp} 做四件事：
+从职责上看，当前 \texttt{main.cpp} 做六类事情：
 \begin{itemize}
-    \item 定义用户可见的命令语言：长选项、短选项、位置参数、默认值与帮助文本；
-    \item 把字符串 token 解析为类型化选项：路径、枚举、正整数、正浮点数与布尔开关；
-    \item 在执行前验证跨字段约束：输入存在、输出非空、输入输出不是同一文件；
-    \item 调用 pipeline 并把执行报告投影为文本或 JSON 输出。
+    \item 定义用户可见命令语言：长选项、短选项、位置参数、帮助文本和版本动作；
+    \item 把字符串 token 转成类型化值：路径、枚举、正整数、正浮点数和布尔开关；
+    \item 归一化运行配置：推断格式、生成默认输出路径、补齐输出扩展名；
+    \item 验证跨字段约束：输入存在、输入不是目录、输出不是目录、输入输出不同、覆盖必须显式确认；
+    \item 构造 \texttt{PipelineConfig}，并把 kernel 相关字段压入 \texttt{JacobiSvdConfig}；
+    \item 调用 pipeline，并把 \texttt{PipelineReport} 投影为人类可读文本或机器可读 JSON。
 \end{itemize}
 
-它明确不做另外几件事：不识别 \texttt{*.mat} 的二进制布局，不解析文本矩阵，不启动 CUDA kernel，
-不管理输出线程，也不决定 SVD 的数值收敛逻辑。这种克制是表示层最重要的工程品质。
+它明确不做另外几件事：不读取矩阵值，不解释网络字节序，不分配 CUDA 设备内存，不管理线程池生命周期，
+不执行布局转置 benchmark。布局转置自动调优是否启用由 CLI 传达，但调优本身仍发生在领域/应用执行边界。
+这种克制使表示层像一个意图编译器（intent compiler）：它负责把用户语言翻译为运行配置，而不是偷走下层语义。
 
-\subsection{命令语言：两类 token 与三类动作}
+\subsection{命令语言：token 分类与动作空间}
 
-CLI 的输入是操作系统传入的 \texttt{argc/argv}。在 \texttt{ArgParser::parse} 中，每个 token 被划分为三类：
+操作系统传入的 \texttt{argc/argv} 没有类型，只有字符串。当前解析器把每个 token 归入三类：
 \[
     token \in
     \{\text{long option},\text{short option},\text{positional argument}\}.
 \]
-长选项以 \texttt{--} 开头，支持两种值绑定方式：
+长选项以 \texttt{--} 开头，支持等号绑定和后继 token 绑定：
 \[
-    \texttt{--epsilon=1e-10}
-    \quad\text{or}\quad
+    \texttt{--epsilon=1e-10},
+    \qquad
     \texttt{--epsilon 1e-10}.
 \]
-短选项以 \texttt{-} 开头，既支持无值开关的聚合，也支持带值选项：
+短选项以 \texttt{-} 开头。无值短选项可以聚合；带值短选项可以把值放在同一 token 剩余部分中：
 \[
     \texttt{-qv},\qquad
     \texttt{-e1e-10},\qquad
     \texttt{-e 1e-10}.
 \]
-普通 token 被收集为位置参数，并在选项解析结束后依次填充输入路径与输出路径。
+普通 token 被暂存为位置参数，并在选项解析结束后依次填补输入路径与输出路径：
+\[
+    \texttt{jacobi-svd a.mat b.mat}
+    \equiv
+    \texttt{jacobi-svd --input a.mat --output b.mat}.
+\]
 
-解析结果不是直接执行，而是落到 \texttt{ParseResult}：
+解析结果落入 \texttt{ParseResult}：
 \[
     \texttt{ParseResult}
     =
     (\texttt{ParseAction},\texttt{CliOptions}).
 \]
-\texttt{ParseAction} 有三个取值：
+\texttt{ParseAction} 是一个三值枚举：
 \[
     \{\texttt{run},\texttt{help},\texttt{version}\}.
 \]
-这是一处小而重要的设计。帮助与版本不是运行配置的特殊情形，而是独立动作。若用户请求
-\texttt{--help}，解析器不要求输入文件存在；若用户请求 \texttt{--version}，也不需要构造 pipeline。
-因此，动作空间与执行空间被清楚分开：
+这是一处小而硬的边界。帮助和版本不是运行配置的特殊情况，而是独立动作：
 \[
-    \texttt{help/version}: argv \rightarrow stdout,
+    \texttt{help/version}: argv\rightarrow stdout,
 \]
 \[
-    \texttt{run}: argv \rightarrow \texttt{PipelineConfig} \rightarrow \texttt{PipelineReport}.
+    \texttt{run}: argv\rightarrow \texttt{CliOptions}\rightarrow \texttt{PipelineConfig}
+    \rightarrow \texttt{PipelineReport}.
 \]
+因此，\texttt{--help} 和 \texttt{--version} 不要求输入文件存在，也不需要构造 pipeline。
+不过它们仍然经过基础 token 解析：未知选项、非法短选项或布尔选项错误携带 \texttt{=value} 仍会被拒绝。
+这保证了“非执行动作不碰文件系统”，同时不把拼写错误悄悄吞掉。
 
-\subsection{选项表：用数据结构定义接口面}
+\subsection{选项表：接口面由数据结构定义}
 
-\texttt{ArgParser} 并没有把每个选项写成一组分散的 \texttt{if/else}。相反，它用
-\texttt{OptionDefinition} 表驱动解析：
+\texttt{ArgParser} 没有把每个选项写成散落的 \texttt{if/else}。它用
+\texttt{OptionDefinition} 表驱动命令语言：
 \[
     d=(id,long,short,requires\_value,value\_hint,description).
 \]
-每个命令行选项由同一个结构描述，这让接口面具有单一事实来源（single source of truth）。
-帮助文本、长选项查找、短选项查找和值需求检查都依赖这张表。
+帮助文本生成、长选项查找、短选项查找和值需求检查都依赖同一张表。这使 CLI 接口具有单一事实来源
+（single source of truth）：新增选项时，开发者必须同时回答它的内部标识、长名、短名、是否带值、
+值占位符和用户说明。
 
-当前 CLI 暴露的选项可以归纳为四组：
+当前选项可以按职责分为六组：
 
 \begin{table}[htbp]
     \centering
-    \small
-    \begin{tabular}{p{0.13\textwidth}p{0.50\textwidth}p{0.27\textwidth}}
+    \scriptsize
+    \begin{tabular}{@{}lll@{}}
         \toprule
         类别 & 选项 & 系统含义 \\
         \midrule
-        数据边界 & \texttt{--input}, \texttt{--output} & 输入矩阵流与输出结果流路径 \\
-        格式契约 & \texttt{--input-format}, \texttt{--output-format}, \texttt{--format} & \texttt{auto|mat|txt} 格式选择 \\
-        计算配置 & \texttt{--epsilon}, \texttt{--max-sweeps}, \texttt{--threads-per-block} & Jacobi SVD kernel 参数 \\
-        运行控制 & \texttt{--queue-capacity}, \texttt{--dry-run}, \texttt{--json-report}, \texttt{--quiet} & pipeline 背压与报告行为 \\
+        数据边界
+        & \begin{tabular}[t]{@{}l@{}}
+              \texttt{--input}/\texttt{-i}, \texttt{--output}/\texttt{-o}
+          \end{tabular}
+        & 输入矩阵流与输出结果流路径 \\
+        格式契约
+        & \begin{tabular}[t]{@{}l@{}}
+              \texttt{--input-format}, \texttt{--output-format}, \\
+              \texttt{--format}/\texttt{-f}
+          \end{tabular}
+        & \texttt{auto|mat|txt} 格式选择 \\
+        数值配置
+        & \begin{tabular}[t]{@{}l@{}}
+              \texttt{--epsilon}/\texttt{-e}, \texttt{--max-sweeps}/\texttt{-s}, \\
+              \texttt{--threads-per-block}/\texttt{-t}
+          \end{tabular}
+        & Jacobi SVD kernel 基本参数 \\
+        布局策略
+        & \begin{tabular}[t]{@{}l@{}}
+              \texttt{--layout-transpose-mode}, \texttt{--layout-transpose-min-cols}, \\
+              \texttt{--layout-transpose-min-elems}, \texttt{--layout-transpose-auto-tune}, \\
+              \texttt{--layout-transpose-bench-reps}, \texttt{--layout-transpose-bench-sweeps}
+          \end{tabular}
+        & GPU 内部布局转置与调优参数 \\
+        运行控制
+        & \begin{tabular}[t]{@{}l@{}}
+              \texttt{--queue-capacity}/\texttt{-c}, \texttt{--force}/\texttt{-y}, \\
+              \texttt{--dry-run}, \texttt{--print-config}
+          \end{tabular}
+        & pipeline 窗口、覆盖保护和配置展示 \\
+        报告动作
+        & \begin{tabular}[t]{@{}l@{}}
+              \texttt{--json-report}, \texttt{--quiet}/\texttt{-q}, \\
+              \texttt{--help}/\texttt{-h}, \texttt{--version}/\texttt{-v}
+          \end{tabular}
+        & 输出报告、帮助和版本 \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-这种表驱动设计的价值不在于“减少代码行数”，而在于限制复杂度增长。新增选项时，开发者首先必须回答：
-它的标识是什么？长名是什么？是否有短名？是否需要值？帮助占位符是什么？用户可见描述是什么？
-这些问题被数据结构强迫在同一位置回答，接口演化更难变成隐式补丁。
+这张表最重要的价值不是节省代码行数，而是限制复杂度增长。命令行接口一旦被实验脚本使用，就会变成事实上的用户空间契约。
+选项定义集中在一处，才更容易审查“我们到底向用户承诺了什么”。
 
 \subsection{默认值：把常用路径做成普通路径}
 
-\texttt{CliOptions} 定义了运行时默认值：
+\texttt{CliOptions} 给出运行默认值：
 \[
-    \epsilon=10^{-9},\quad
-    max\_sweeps=128,\quad
-    threads\_per\_block=256,\quad
-    queue\_capacity=4.
+\begin{aligned}
+    \epsilon &= 10^{-9},\\
+    \texttt{max\_sweeps} &= 128,\\
+    \texttt{threads\_per\_block} &= 256,\\
+    \texttt{queue\_capacity} &= 4,\\
+    \texttt{layout\_transpose\_mode} &= \texttt{auto},\\
+    \texttt{layout\_transpose\_min\_columns} &= 16,\\
+    \texttt{layout\_transpose\_min\_elements} &= 4096.
+\end{aligned}
 \]
-输入与输出格式默认均为 \texttt{auto\_detect}。从系统设计角度看，这些默认值并非装饰，而是把最常见的实验路径
-变成最短命令：
+自动调优默认关闭，调优重复次数默认为 $2$，调优 sweep 上限默认为 $8$。输入与输出格式默认是
+\texttt{auto\_detect}，也就是把格式选择延迟到扩展名和 pipeline 解析边界。
+
+这些默认值让最常见路径保持短命令：
+\begin{bashlisting}
+jacobi-svd-cuda experiments/inputs/a.mat
+\end{bashlisting}
+若用户省略输出路径，CLI 会生成默认输出：
 \[
-    \texttt{jacobi-svd input.mat output.mat}.
+    \texttt{<input-parent>/<input-stem>.svd.<ext>}.
 \]
-用户只需要在偏离默认契约时提供额外信息，例如提高收敛精度、改变 CUDA block 大小、指定文本格式或开启 JSON 报告。
+例如 \texttt{a.mat} 默认得到 \texttt{a.svd.mat}，\texttt{a.txt} 默认得到 \texttt{a.svd.txt}。
+若输入 stem 为空，则退回 \texttt{result}。这让“跑一个文件并得到旁边的结果文件”成为普通路径，而不是要求用户每次重复写输出名。
 
-这体现了一条朴素原则：好 CLI 不应要求用户重复系统已经能可靠推断的事实。格式可以由扩展名推断，
-则默认 \texttt{auto}；输出报告通常应可读，则默认文本摘要；批量脚本需要机器可读输出时，
-再显式使用 \texttt{--json-report}。默认路径越短，错误输入的表面积越小。
+这体现了一条工程原则：系统能可靠推断的事实，不要逼用户重复；系统不能可靠推断的事实，必须要求用户显式说明。
+输入格式为 \texttt{auto} 且输入扩展名既不是 \texttt{.mat} 也不是 \texttt{.txt} 时，CLI 直接报错，要求使用
+\texttt{--input-format}。它没有把未知文件丢给 I/O 层“试试看”。在数值工具里，猜测式输入通常不是友好，而是把错误推迟。
 
-当然，默认值也会形成隐式契约。若未来修改 \texttt{epsilon} 或 \texttt{max\_sweeps}，就可能改变既有实验结果。
-因此这些默认值应当像 API 一样被审慎对待；对数值程序而言，默认收敛阈值属于可复现性
-（reproducibility）的一部分，而不仅仅是 UI 便利。
+\subsection{归一化：从不完整命令到有效运行配置}
 
-\subsection{解析状态机：一次线性扫描完成 token 归类}
+\texttt{normalize\_run\_options} 是当前 CLI 优化后最值得注意的函数。它不执行 pipeline，却把用户的简写命令补全为更稳定的
+\texttt{CliOptions}。其逻辑可以拆成三步。
 
-\texttt{ArgParser::parse} 的主循环是一个线性扫描状态机：
+\paragraph{第一，输入必须存在于意图中。}
+若用户没有提供 \texttt{input\_path}，归一化立即失败：
 \[
-    i=1;\quad
-    \text{while } i<argc.
+    \texttt{Missing input file. Use --input <path>.}
 \]
-每次读取 \texttt{argv[i]} 后执行如下分类：
+随后，若输入格式仍为 \texttt{auto}，CLI 至少要求扩展名可识别。这里的检查不是最终格式解析；最终 I/O 格式仍由
+pipeline 层的 \texttt{resolve\_file\_format} 固化。但 CLI 必须知道足够信息，才能安全生成默认输出扩展名并给出早期诊断。
 
+\paragraph{第二，输出路径可省略，但省略必须有确定规则。}
+若 \texttt{output\_path} 为空，CLI 先选择输出格式。若用户显式给了 \texttt{--output-format} 或
+\texttt{--format}，就使用用户指定格式；否则使用输入格式或输入扩展名推断结果。随后生成：
+\[
+    \texttt{stem + ".svd" + canonical\_extension(format)}.
+\]
+这条规则有两个好处：输出名表明它是 SVD 结果；输出扩展名与写出格式一致。
+
+\paragraph{第三，显式输出路径不被粗暴改写。}
+若用户给了输出路径但没有给输出格式，且输出路径扩展名无法识别，CLI 会选择一个 fallback 格式；
+如果输出路径完全没有扩展名，则追加 \texttt{.mat} 或 \texttt{.txt}；如果它已经有未知扩展名，则保留用户写下的路径文本，
+只把 \texttt{output\_format} 归一化为 fallback。这个细节体现了边界品味：帮助用户补齐明显缺失的信息，
+但不要擅自重命名用户明确给出的文件名。
+
+\subsection{解析状态机：一次线性扫描}
+
+\texttt{ArgParser::parse} 的主体是一个线性扫描状态机：
+\[
+    i=1;\quad \text{while } i<argc.
+\]
+每个 token 按固定顺序分类：
 \begin{enumerate}
     \item 空 token 被跳过；
-    \item \texttt{--} 表示选项结束，后续所有 token 都作为位置参数；
+    \item \texttt{--} 表示选项结束，后续 token 全部作为位置参数；
     \item 以 \texttt{--} 开头的 token 交给 \texttt{parse\_long\_option}；
     \item 以单个 \texttt{-} 开头且长度大于 $1$ 的 token 交给 \texttt{parse\_short\_options}；
     \item 其他 token 作为位置参数保存。
 \end{enumerate}
 
-这种设计的复杂度为
+扫描完成后，位置参数按顺序填补输入与输出路径。若填补后仍有剩余位置参数，则报错：
 \[
-    O(|argv|\cdot |\mathcal{D}|),
+    |\text{positional}|\le 2.
 \]
-其中 $\mathcal{D}$ 是选项定义表。由于当前选项数量很小，线性查找已经足够直接。
-若未来选项数量显著增长，可以把长名和短名索引预构造成哈希表（hash table），但在当前规模下那只会增加不必要复杂度。
-
-这里还有一个值得注意的细节：带值选项会通过引用参数 \texttt{index} 前移扫描位置。
-例如命令片段
+因此，显式风格和简洁风格共享同一语义归约：
 \[
-    \texttt{--epsilon 1e-10}
+    \texttt{--input a.mat --output b.mat}
+    \quad\text{and}\quad
+    \texttt{a.mat b.mat}.
 \]
-中，解析 \texttt{--epsilon} 时会消耗后一个 token；主循环随后统一递增 \texttt{index}。
-这使“值消费”只发生在一个局部协议中，而不是让主循环分散处理多种步长。
 
-\subsection{长选项与短选项：同一语义，两种表面形式}
-
-\texttt{parse\_long\_option} 首先去掉前缀 \texttt{--}，再检查是否包含等号：
+复杂度为
 \[
-    \texttt{--name=value}
-    \Rightarrow
-    (name,value).
+    O(NM),
 \]
-若选项需要值，值可以来自等号右侧，也可以来自下一个 token；若选项不需要值却出现等号，则立即报错。
-这避免了 \texttt{--quiet=false} 这类看似合理但语义含糊的输入被悄悄接受。
+其中 $N$ 是 token 数，$M$ 是选项定义数。由于 $M$ 很小，实际近似线性。若未来选项数量显著增加，
+可以把长名和短名索引预构造成哈希表（hash table），但当前规模下线性查找更直接，也更容易审查。
 
-\texttt{parse\_short\_options} 则按字符扫描短选项串。无值选项可以连续出现，例如
-\texttt{-qv} 等价于 \texttt{-q -v}。带值选项一旦出现，就消费 token 剩余部分或后续 token，
-然后结束当前短选项串。例如：
+\subsection{长短选项：多种表面形式归约到同一语义}
+
+\texttt{parse\_long\_option} 先去掉 \texttt{--} 前缀，再检查是否包含等号：
 \[
-    \texttt{-e1e-10}
-    \Rightarrow
-    \texttt{epsilon}=10^{-10}.
+    \texttt{--name=value}\Rightarrow(name,value).
 \]
-这种行为与许多 UNIX 风格 CLI 兼容，同时保持了一个简单约束：带值短选项必须是当前短选项串的最后一个语义单元。
+若选项需要值，值可以来自等号右侧，也可以来自下一个 token；若选项不需要值却带了等号，则立即报错。
+因此，\texttt{--quiet=false} 不会被接受。布尔开关只有出现或不出现两种状态，不引入第三种“看起来像 false 但其实已出现”的语义。
 
-长短选项最终都调用同一个 \texttt{apply\_option}。因此，\texttt{-i a.mat} 与
-\texttt{--input a.mat} 不会走两套配置逻辑。这一点很重要：表面语法可以有多个入口，
-但语义归约（semantic reduction）必须唯一。
+\texttt{parse\_short\_options} 按字符扫描短选项串。无值短选项可以连续出现，例如：
+\[
+    \texttt{-qv}\equiv \texttt{-q -v}.
+\]
+带值短选项一旦出现，就消费当前 token 剩余部分或下一个 token，并结束该短选项串：
+\[
+    \texttt{-e1e-10}\Rightarrow \texttt{epsilon}=10^{-10}.
+\]
+这与常见 UNIX 风格 CLI 一致，同时保持一个简单约束：带值短选项必须是当前短选项串的最后一个语义单元。
+
+无论长选项还是短选项，最终都调用 \texttt{apply\_option}。所以
+\texttt{-i a.mat} 与 \texttt{--input a.mat} 不会走两套配置逻辑。表面语法可以有多个入口，
+语义归约必须唯一；这正是避免 CLI 演化成分支泥潭的关键。
 
 \subsection{类型化转换：字符串不能泄漏到应用层}
 
-命令行天然只有字符串；应用层需要的是类型。当前实现把字符串到类型的转换集中在四类函数中：
+命令行天然只有字符串；应用层需要的是类型。当前实现把字符串转换集中在几类小函数中：
 \[
 \begin{aligned}
-    &\texttt{parse\_matrix\_format},\qquad
-      \texttt{parse\_positive\_int},\\
-    &\texttt{parse\_positive\_size},\qquad
+    &\texttt{parse\_matrix\_format},\quad
+      \texttt{parse\_layout\_transpose\_mode},\\
+    &\texttt{parse\_positive\_int},\quad
+      \texttt{parse\_positive\_size},\quad
       \texttt{parse\_positive\_double}.
 \end{aligned}
 \]
 
-\texttt{parse\_matrix\_format} 先执行 ASCII 小写化，然后只接受
+\texttt{parse\_matrix\_format} 只接受
 \[
-    \{\texttt{auto},\texttt{mat},\texttt{txt}\}.
+    \{\texttt{auto},\texttt{mat},\texttt{txt}\},
 \]
-这使格式值成为封闭集合（closed set），而不是任意字符串。封闭集合的好处是：
-下游 pipeline 可以用 \texttt{enum class MatrixFileFormat} 做穷尽分支，不必再次处理拼写错误。
+\texttt{parse\_layout\_transpose\_mode} 只接受
+\[
+    \{\texttt{auto},\texttt{on},\texttt{off}\}.
+\]
+两者都先做 ASCII 小写化，使用户不必为大小写付出额外成本。更重要的是，它们把自由字符串收缩为封闭集合
+（closed set）。下游可以用 \texttt{enum class} 做穷尽分支，而不必再次处理拼写错误。
 
-数值解析函数使用标准库转换例程：\texttt{std::stoi}、\texttt{std::stoull} 与
-\texttt{std::stod}。随后代码检查解析位置是否已经到达字符串末尾：
+数值解析函数使用标准库的 \texttt{std::stoi}、\texttt{std::stoull} 和 \texttt{std::stod}，
+随后检查解析位置是否到达字符串末尾：
 \[
-    parsed = |text|.
+    parsed=|text|.
 \]
-这个检查非常关键。若缺少它，\texttt{12abc} 可能被解析为 \texttt{12} 并继续执行。
-对数值软件而言，这类“部分接受”比直接失败更危险，因为用户会以为输入已经被完整理解。
+这个检查拒绝 \texttt{12abc} 这类部分解析。对数值程序来说，“悄悄接受前缀”比直接失败危险得多，
+因为用户会误以为整个输入已被理解。
 
-\texttt{parse\_positive\_double} 还额外检查：
+\texttt{parse\_positive\_double} 还要求
 \[
-    \texttt{isfinite}(x)\land x>0.
+    \operatorname{isfinite}(x)\land x>0.
 \]
-这拒绝了 \texttt{NaN}、\texttt{inf}、零和负数。对于 Jacobi SVD，\texttt{epsilon} 是相对收敛阈值，
-必须是正的有限数。把这个前置条件（precondition）放在 CLI 层，可以让 kernel 配置保持简单。
+因此 \texttt{NaN}、\texttt{inf}、零和负数都不能成为 \texttt{epsilon}。Jacobi SVD 的收敛阈值必须是正的有限数；
+把这个前置条件（precondition）放在 CLI 层，可以让 kernel 配置对象保持简单。
 
 \subsection{跨字段验证：单个 token 合法不代表配置合法}
 
-单个选项被成功解析后，整体配置仍可能无效。例如输入路径为空、输出路径为空、输入文件不存在，
-或者输入输出指向同一个文件。\texttt{validate\_run\_options} 负责这些跨字段约束：
+类型转换成功之后，整体配置仍可能无效。当前 \texttt{validate\_run\_options} 检查五类跨字段约束：
 \[
-    input\_path\ne\varnothing,\qquad
-    output\_path\ne\varnothing,
+    exists(input),
+    \qquad
+    \neg is\_directory(input),
+    \qquad
+    \neg is\_directory(output),
 \]
 \[
-    exists(input\_path),
+    normalize(input)\ne normalize(output),
+    \qquad
+    \neg exists(output)\lor force.
 \]
+
+输入文件必须存在，且不能是目录。输出路径不能指向目录。输入与输出不能规范化为同一路径。若输出文件已经存在，
+用户必须显式使用 \texttt{--force} 或 \texttt{-y}。
+
+这里的覆盖保护是这次 CLI 语义中很重要的一笔。旧式小工具常常默认覆盖输出，但对矩阵流而言这很危险：
+一次误写可能直接毁掉昂贵生成的实验数据。当前实现把覆盖变成显式承诺：
 \[
-    normalize(input\_path)\ne normalize(output\_path).
+    \texttt{exists(output)}
+    \land
+    \neg\texttt{force}
+    \Rightarrow
+    \text{argument error}.
 \]
+这符合“不破坏用户空间”的精神。程序的工作是服务用户，不是用默认覆盖来教育用户备份数据。
 
-最后一条约束尤其重要。若允许输入输出为同一文件，系统可能在读取尚未完成时覆盖输入数据。
-对 \texttt{*.mat} 这种内存映射格式，这甚至可能制造更隐蔽的错误：映射视图、文件截断和输出重建之间的交互
-会让失败不再表现为简单异常，而可能表现为数据腐化。因此 CLI 层提前拒绝同一路径，是一个非常便宜但非常重要的保护。
+路径比较通过 \texttt{std::filesystem::absolute} 与 \texttt{lexically\_normal} 做词法规范化
+（path normalization）。这能覆盖最常见的相对路径误用，例如 \texttt{a.mat} 与
+\texttt{./a.mat}。但需要诚实指出：这不是完整文件身份判断。硬链接、符号链接、大小写不敏感文件系统、
+Windows 短路径名等平台细节，仍可能让不同文本路径指向同一底层文件。当前实现已经防住普通误操作；
+若未来进入更严苛的生产环境，可以升级为平台文件 ID 比较，例如 POSIX 的 \texttt{st\_dev/st\_ino}
+或 Windows file index。
 
-路径比较辅助函数使用 \texttt{std::filesystem::absolute} 与 \texttt{lexically\_normal}
-做路径规范化（path canonicalization）。若绝对路径求值失败，则退回词法规范化。
-需要诚实指出：这不是完整的物理同一性判断。硬链接、符号链接、大小写不敏感文件系统、短路径名等平台细节，
-仍可能让两个不同文本路径指向同一底层文件。当前实现已经覆盖了最常见的误用场景；若该工具进入更严苛的生产环境，
-可以进一步使用平台文件标识符，例如 POSIX 的 \texttt{st\_dev/st\_ino} 或 Windows 的 file index。
+\subsection{配置映射：CliOptions 与 PipelineConfig 不是同一个对象}
 
-\subsection{配置映射：从 CliOptions 到 PipelineConfig}
-
-\texttt{make\_pipeline\_config} 是 CLI 层与应用层之间的唯一桥：
+\texttt{make\_pipeline\_config} 是表示层与应用层之间的唯一桥：
 \[
     \Phi:\texttt{CliOptions}\rightarrow\texttt{PipelineConfig}.
 \]
-映射规则非常直接：
+映射规则可以写成：
 \[
 \begin{aligned}
-    input\_path          &\mapsto input\_path,\\
-    output\_path         &\mapsto output\_path,\\
-    input\_format        &\mapsto input\_format,\\
-    output\_format       &\mapsto output\_format,\\
-    queue\_capacity      &\mapsto max\_queued\_results,\\
-    (\epsilon,max\_sweeps,threads\_per\_block)
-        &\mapsto kernel\_config.
+    \texttt{input\_path} &\mapsto \texttt{input\_path},\\
+    \texttt{output\_path} &\mapsto \texttt{output\_path},\\
+    \texttt{input\_format} &\mapsto \texttt{input\_format},\\
+    \texttt{output\_format} &\mapsto \texttt{output\_format},\\
+    \texttt{queue\_capacity} &\mapsto \texttt{max\_queued\_results},\\
+    \{\epsilon,\texttt{max\_sweeps},\texttt{threads\_per\_block},
+    \texttt{layout fields}\}
+    &\mapsto \texttt{kernel\_config}.
 \end{aligned}
 \]
-这个函数的意义在于把两个对象的演化隔离开。\texttt{CliOptions} 是用户接口对象。
-它还保存 dry-run、JSON 报告、静默模式等只影响表示层的控制位；\texttt{PipelineConfig}
-是应用层执行对象，只包含 pipeline 真正需要的参数。
 
-因此，\texttt{dry\_run} 不会泄漏进 pipeline。它在 \texttt{main} 中被截获：
+这里最重要的是分离。 \texttt{CliOptions} 是用户接口对象，它包含 \texttt{dry\_run}、
+\texttt{print\_config}、\texttt{json\_report}、\texttt{quiet}、\texttt{force\_overwrite}
+等表示层字段；\texttt{PipelineConfig} 是应用层执行对象，只包含 pipeline 真正需要的输入、输出、队列窗口和 kernel 配置。
+
+因此，\texttt{dry\_run} 不会泄漏到 pipeline。它在 \texttt{main} 中被截获：
 \[
-    \texttt{options.dry\_run}
+    \texttt{dry\_run}
     \Rightarrow
     \texttt{print\_dry\_run\_config}
     \Rightarrow
     \texttt{return 0}.
 \]
-这说明 dry-run 的语义是“验证并展示 CLI 归一化结果”，而不是“构造一个不运行的 pipeline”。
-边界越清楚，后续维护越不容易把 UI 控制位误传到核心执行层。
+这说明 dry-run 的语义是“完成 CLI 解析、归一化和验证，然后展示最终配置”，而不是“构造一个不执行的 pipeline”。
+同理，\texttt{force\_overwrite} 只影响进入 pipeline 前的覆盖检查；一旦检查通过，下层只看到一个普通输出路径。
 
-\subsection{报告模型：人类可读与机器可读的双通道}
+\subsection{布局转置选项：性能策略成为显式契约}
 
-pipeline 返回 \texttt{PipelineReport}：
+第 03 章已经讨论过：单边雅可比算法天然围绕列对正交化，而外部矩阵存储采用行主序。为了提高 GPU 内部访存局部性，
+kernel 层支持布局转置路径。当前 CLI 把这条性能策略显式暴露出来：
 \[
-    R=(testcase\_count,emitted\_matrix\_count,total\_sweeps).
+    \texttt{--layout-transpose-mode auto|on|off}.
 \]
-\texttt{main.cpp} 将其投影为两种输出：
+\texttt{auto} 表示按阈值启用；\texttt{on} 表示强制启用；\texttt{off} 表示强制禁用。
+自动模式还接收两个阈值：
 \[
-    \Pi_{text}(R),\qquad \Pi_{json}(R).
+    columns\ge C_{\min},
+    \qquad
+    rows\cdot columns\ge E_{\min}.
 \]
+默认值为
+\[
+    C_{\min}=16,\qquad E_{\min}=4096.
+\]
+
+此外，用户可以使用：
+\begin{bashlisting}
+--layout-transpose-auto-tune
+\end{bashlisting}
+让 pipeline 在正式执行前运行微基准扫描，并把推荐阈值写入本次运行的 runtime kernel 配置。
+调优本身还有两个控制参数：
+\[
+    \texttt{--layout-transpose-bench-reps},
+    \qquad
+    \texttt{--layout-transpose-bench-sweeps}.
+\]
+前者控制每个尺寸重复次数，后者控制每次 benchmark 的 sweep 上限。
+
+这组参数的存在说明 CLI 不只是功能开关，也承载性能实验的可复现契约。若论文或实验记录写下：
+\begin{bashlisting}
+--layout-transpose-mode auto --layout-transpose-min-cols 32
+--layout-transpose-min-elems 8192
+\end{bashlisting}
+那么这不是 UI 细节，而是实验状态的一部分。尤其在 CUDA 程序中，性能结果依赖设备、矩阵规模、内存布局和 kernel 启动参数；
+CLI 必须让这些自由度可见，否则 benchmark 就失去可解释性。
+
+同时，CLI 只传达策略，不在表示层做 benchmark。这保持了依赖方向：性能测量需要 CUDA runtime 和 kernel 层知识，
+不应塞进 \texttt{main.cpp}。好入口要表达意图，别把世界搬进入口。
+
+\subsection{配置展示：dry-run 与 print-config 的差异}
+
+当前实现提供两种配置展示模式：
+\[
+    \texttt{--dry-run},
+    \qquad
+    \texttt{--print-config}.
+\]
+\texttt{--dry-run} 会完成参数解析、归一化和验证，然后输出配置摘要并直接成功退出：
+\[
+    \texttt{Dry run: pipeline was not executed.}
+\]
+它适合检查默认输出路径、格式推断、布局转置阈值和覆盖状态，尤其适合写实验脚本前确认命令是否会触碰正确文件。
+
+\texttt{--print-config} 则在真正执行 pipeline 前打印有效配置：
+\[
+    \texttt{Effective configuration:}
+\]
+随后程序继续运行。它适合把配置与运行报告一起保存在日志里。对可复现实验而言，这很有价值：
+命令行本身可能来自脚本变量，而 effective configuration 是归一化后的真实执行参数。
+
+两者输出字段基本一致：输入、输出、输入/输出格式、epsilon、最大 sweep、线程块大小、布局转置模式、布局阈值、
+自动调优参数、队列容量和覆盖标志。区别只在控制流：
+\[
+    \texttt{dry-run}: validate\rightarrow print\rightarrow exit,
+\]
+\[
+    \texttt{print-config}: validate\rightarrow print\rightarrow run.
+\]
+
+\subsection{报告模型：文本摘要与 JSON 报告双通道}
+
+pipeline 返回 \texttt{PipelineReport}。当前报告不只包含 testcase 数和 sweep 总数，还包含布局转置运行时状态：
+\[
+\begin{aligned}
+    R = (&\texttt{testcase\_count},
+         \texttt{emitted\_matrix\_count},
+         \texttt{total\_sweeps},\\
+        &\texttt{layout\_transpose\_mode},
+         \texttt{layout\_transpose\_min\_columns},\\
+        &\texttt{layout\_transpose\_min\_elements},
+         \texttt{layout\_transpose\_auto\_tuned},\\
+        &\texttt{layout\_transpose\_estimated\_best\_speedup},\\
+        &\texttt{elapsed\_ms}).
+\end{aligned}
+\]
+\texttt{elapsed\_ms} 不来自 pipeline，而是在 \texttt{main} 中用
+\texttt{std::chrono::steady\_clock} 测得。它覆盖 \texttt{run\_pipeline} 调用本身，即 pipeline 执行时间；
+不包含前面的参数解析、帮助文本构造或 dry-run 输出。
+
 默认情况下，程序输出文本摘要：
 \[
     \texttt{Pipeline completed.}
 \]
-以及测试用例数量、写出矩阵数量和 sweep 总数。若用户指定 \texttt{--json-report}，程序额外输出 JSON 对象。
-若用户指定 \texttt{--quiet}，文本摘要被抑制；JSON 报告仍可输出。
-
-这给出了一个清楚的可组合语义：
+文本摘要包括用例数量、写出矩阵数和总迭代轮数，也报告布局策略、调优结果和耗时。
+若用户指定 \texttt{--json-report}，程序额外输出 JSON 对象；若用户指定
+\texttt{--quiet}，文本摘要被抑制，但 JSON 报告仍然可以输出。因此：
 \[
     \texttt{--quiet --json-report}
     \Rightarrow
     \text{只输出机器可读报告}.
 \]
-这对脚本和基准测试很重要。人类可读输出通常稳定性较弱，字段名、空格和排版可能调整；
-机器可读输出应尽量保持稳定，因为它会被下游工具解析。当前 JSON 输出字段直接对应 pipeline 报告结构；
-没有混入帮助文本或日志前缀，这是一种正确的接口习惯。
+若用户只写 \texttt{--quiet} 而不写 \texttt{--json-report}，成功路径可以没有 stdout 输出，只由退出码表达成功。
 
-不过也需要指出一个当前边界：JSON 输出由手写 \texttt{std::cout} 拼接完成。由于当前字段均为数值，
-这没有转义风险；若未来加入路径、错误消息或设备名称等字符串字段，就应引入专门的 JSON writer 或最小转义函数，
-避免把机器接口建立在临时字符串拼接上。
+当前 JSON 由手写 \texttt{std::cout} 拼接。因为字段都是数值或固定枚举字符串，转义风险很低。
+但如果未来加入路径、设备名、错误消息或 GPU driver 字符串，就应引入最小 JSON 转义函数或专门 writer。
+机器接口一旦被脚本依赖，就不能建立在“这个字符串大概不会有引号”的侥幸上。
 
 \subsection{退出码：把失败分类暴露给调用者}
 
 \texttt{main} 的异常边界定义了三个退出码（exit code）：
 \[
-    0:\text{成功或非执行动作成功},
+    0:\text{成功，或帮助/版本/dry-run 等非执行动作成功},
 \]
 \[
     2:\text{CLI 参数错误},
@@ -334,183 +517,175 @@ pipeline 返回 \texttt{PipelineReport}：
 \[
     1:\text{执行失败}.
 \]
-其中 \texttt{CliArgumentError} 专门表示用户输入不满足 CLI 契约，例如未知选项、缺失值、非法数值、
-输入不存在或输入输出路径相同。它被捕获后打印：
+
+\texttt{CliArgumentError} 专门表示用户输入不满足 CLI 契约，例如未知选项、缺失值、非法数值、
+输入不存在、输出已存在但未 \texttt{--force}、输入输出相同等。它被捕获后打印：
 \[
     \texttt{Argument error: ...}
 \]
-并提示使用 \texttt{--help}。
-
-其他 \texttt{std::exception} 被归类为执行失败，例如 I/O 错误、CUDA runtime 错误、pipeline 内部错误或系统资源失败。
+并提示：
+\[
+    \texttt{Use --help for usage.}
+\]
+其他 \texttt{std::exception} 归类为执行失败，例如 I/O 错误、CUDA runtime 错误、pipeline 内部错误或系统资源失败。
 它们打印：
 \[
     \texttt{Execution failed: ...}
 \]
 并返回 \texttt{1}。
 
-这种分类对脚本很有价值。调用者可以区分“命令写错了”和“命令有效但执行环境失败了”：
+这对脚本非常重要。调用者可以区分“命令写错了”和“命令有效但运行环境失败了”：
 \[
-    rc=2 \Rightarrow \text{修正调用方式},
+    rc=2\Rightarrow \text{修正调用方式},
     \qquad
-    rc=1 \Rightarrow \text{检查输入数据、设备、文件系统或运行时}.
+    rc=1\Rightarrow \text{检查数据、设备、文件系统或运行时}.
 \]
-对一个实验工具而言，这种失败语义比单纯打印异常消息更有系统感。
+一个实验工具不应只把所有失败揉成 \texttt{1}。失败分类就是自动化系统的语言。
 
-\subsection{错误消息：早失败、局部失败、可行动失败}
+\subsection{错误策略：早失败、局部失败、可行动失败}
 
-\texttt{main.cpp} 的错误策略可概括为三点。
+当前 CLI 的错误策略可以概括为三点。
 
 \paragraph{第一，早失败（fail-fast）。}
-格式字符串、正整数、正浮点数、输入路径和路径冲突都在进入 pipeline 前检查。这样 GPU kernel 不需要承担
-CLI 输入修复责任，pipeline 也不必在执行中猜测用户意图。
+未知选项、缺失值、非法枚举、非正数值、未知输入扩展名、输入不存在、输出冲突和覆盖风险，都在进入 pipeline 前拒绝。
+GPU kernel 不需要承担 CLI 输入修复责任，pipeline 也不必猜测用户到底想覆盖哪个文件。
 
 \paragraph{第二，局部失败（local failure）。}
-每个解析函数只负责一种转换。例如 \texttt{parse\_positive\_int} 不知道 \texttt{max-sweeps}
-的算法含义，只知道它必须是正整数；\texttt{parse\_matrix\_format} 不打开文件，只把字符串映射为枚举。
-错误被固定在最小局部上下文中，诊断更准确。
+每个解析函数只负责一种转换。\texttt{parse\_positive\_int} 不知道
+\texttt{max-sweeps} 的算法意义，只知道它必须是正整数；\texttt{parse\_layout\_transpose\_mode}
+不运行 benchmark，只把字符串映射到枚举。错误被固定在最小上下文中，诊断自然更准确。
 
 \paragraph{第三，可行动失败（actionable failure）。}
-错误消息包含选项名和期望范围，例如：
+错误消息包含选项名和期望集合，例如：
 \[
     \texttt{Invalid value for --format: expected one of \{auto, mat, txt\}.}
 \]
-这类消息不仅说“错了”，还告诉用户如何修正。对 CLI 来说，这就是用户体验（user experience, UX）的核心：
-不是把错误藏起来，而是把错误变成下一步行动。
+这类消息不仅说“错了”，还告诉用户下一步怎么改。CLI 的用户体验（user experience, UX）不是把错误藏起来，
+而是把错误变成下一步行动。
 
-\subsection{形式化正确性：解析器应满足的局部不变量}
+\subsection{正确性不变量：解析器应长期保持什么}
 
-可以把 \texttt{ArgParser} 的正确性表达为若干不变量。
+可以把 \texttt{ArgParser} 的正确性表达为一组局部不变量。
 
 \paragraph{选项唯一性不变量。}
-若一个 token 被识别为长选项，则它必须匹配唯一的 \texttt{long\_name}；若被识别为短选项，
-则每个短选项字符必须匹配唯一的 \texttt{short\_name}。当前定义表中没有重复名称，线性查找返回第一个匹配项。
-为了长期维护，未来可以在构造函数中加入重复检测，把这一不变量从人工约定变成运行期断言。
+每个长选项名和短选项字符都应唯一映射到一个 \texttt{OptionId}。当前线性查找返回第一个匹配项；
+因此定义表不应出现重复长名或重复短名。未来可以在 \texttt{ArgParser} 构造时加入重复检测，
+把人工约定提升为运行期断言。
 
 \paragraph{值需求不变量。}
 对于任意选项 $o$：
 \[
     o.requires\_value=true
     \Rightarrow
-    apply(o,value)
+    \texttt{apply\_option}(o,value),
 \]
-必须接收到一个值；
 \[
     o.requires\_value=false
     \Rightarrow
-    apply(o,\varnothing)
+    \texttt{apply\_option}(o,\varnothing).
 \]
-且长选项不能带 \texttt{=value}。这保证布尔开关不会出现三值语义。
+长选项若不需要值，则不能写成 \texttt{--name=value}。这保证布尔开关保持二值语义。
 
 \paragraph{位置参数不变量。}
-位置参数至多两个：
-\[
-    |\text{positional}|\le 2.
-\]
-若 \texttt{--input} 或 \texttt{--output} 未显式提供，则位置参数按顺序填补。若填补后仍有额外位置参数，
-解析失败。这样 CLI 同时支持显式风格：
-\[
-    \texttt{--input a.mat --output b.mat}
-\]
-和简洁风格：
-\[
-    \texttt{a.mat b.mat}.
-\]
+位置参数至多两个。第一个填补输入路径，第二个填补输出路径；若显式 \texttt{--input} 或
+\texttt{--output} 已经提供，对应位置参数就顺延填补空缺。多余位置参数必然失败。
 
 \paragraph{运行前置条件不变量。}
-当且仅当 \texttt{action == run} 时，解析器调用运行选项验证函数。
-因此帮助和版本路径不依赖文件系统状态，而运行路径一定满足基础前置条件。这避免了
-\[
-    \texttt{jacobi-svd --help}
-\]
-因缺少输入文件而失败的荒唐体验。
+只有当 \texttt{action == run} 时，解析器才调用归一化和运行验证。因此帮助与版本动作不依赖文件系统状态；
+运行动作则一定满足基础前置条件。
 
-\subsection{复杂度与性能：CLI 层应当保持廉价}
+\paragraph{配置隔离不变量。}
+表示层控制位不能泄漏进 pipeline。 \texttt{dry\_run}、\texttt{print\_config}、
+\texttt{json\_report}、\texttt{quiet} 和 \texttt{force\_overwrite} 都应在 \texttt{main.cpp}
+中被消费；pipeline 只接收输入、输出、格式、队列窗口和 kernel 配置。
 
-CLI 层的渐近成本很小。设 token 数为 $N$，选项定义数为 $M$，路径检查忽略文件系统常数，则解析成本为：
+\subsection{复杂度与性能：入口代码应该便宜且无惊喜}
+
+CLI 解析的渐近成本远小于一次 dense SVD。设 token 数为 $N$、选项定义数为 $M$，
+则查找成本近似为：
 \[
     O(NM).
 \]
-当前 $M$ 为常数级，实际成本近似 $O(N)$。与一次 dense SVD 的计算成本相比，CLI 解析几乎可以忽略。
+在当前常数规模下，这几乎就是 $O(N)$。真正昂贵的是文件 I/O、CUDA kernel、设备同步和输出写回。
 
-但“性能影响小”不意味着可以随意写。CLI 层处在所有运行的入口，任何不必要的复杂度都会在维护上反复收费。
-当前实现没有引入第三方参数解析库，没有子命令框架，也没有动态配置文件解析。这是合理的：
-项目当前只有一个核心动作，即对输入矩阵流执行 Jacobi SVD。为单动作工具引入复杂 CLI 框架，
-会让特殊情形多于普通路径。
+但“运行成本小”不意味着可以随意写。入口代码处在所有执行路径的最前面，任何复杂度都会在维护和用户脚本中反复收费。
+当前实现没有引入第三方 CLI 框架，没有子命令系统，也没有配置文件合并逻辑。这是合理的：项目当前只有一个核心动作，
+即对输入矩阵流执行 Jacobi SVD。
 
-如果未来出现多个真正独立的操作，例如 \texttt{convert}、\texttt{benchmark}、\texttt{inspect}，
-再引入子命令（subcommand）层才有意义。现在的好设计不是预先搭建宏大框架，而是让当前语法足够清楚、
-错误足够早、扩展点足够自然。
+如果未来出现真正独立的操作，例如 \texttt{convert}、\texttt{inspect}、\texttt{benchmark}，
+再引入子命令（subcommand）才有意义。现在的好设计不是预先搭建宏大框架，而是让当前语法足够清楚、错误足够早、
+扩展点足够自然。
 
-\subsection{与用户脚本的兼容性：不要轻易破坏命令契约}
+\subsection{兼容性：命令行也是用户空间}
 
 CLI 一旦被实验脚本、CI、批处理文件或论文复现实验使用，就成为事实上的用户空间 ABI
-（application binary interface, ABI）。虽然它不是二进制 ABI，但同样具有兼容性约束：
-已有命令不应在无充分理由时改变语义。
-
-因此，以下变化应被视为破坏性变更：
+（application binary interface, ABI）。虽然它不是二进制 ABI，但同样具有兼容性约束。
+以下变化应被视为破坏性变更：
 \begin{itemize}
     \item 删除或重命名已有长选项；
     \item 改变短选项含义；
-    \item 改变默认 \texttt{epsilon}、\texttt{max-sweeps} 或输出顺序；
+    \item 改变默认 \texttt{epsilon}、\texttt{max-sweeps}、\texttt{threads-per-block} 或布局阈值；
+    \item 改变默认输出路径生成规则；
+    \item 改变覆盖保护语义；
     \item 改变 JSON 字段名；
     \item 让原本合法的位置参数形式失效；
-    \item 将参数错误退出码从 \texttt{2} 改为其他值。
+    \item 改变参数错误退出码 \texttt{2}。
 \end{itemize}
 
 这正对应系统工程里的老原则：不要破坏用户空间。对这个项目而言，“用户空间”就是 Klee 的实验脚本、文档示例、
-自动测试和未来读者复现论文结果时写下的命令。
+自动测试和未来读者复现结果时写下的命令。
 
 \subsection{当前实现的边界与可演化方向}
 
-\paragraph{第一，解析器尚未生成 shell completion。}
-由于选项定义已经集中在 \texttt{definitions\_} 中，未来可以从同一张表生成 Bash、Zsh 或 PowerShell
-补全脚本（shell completion）。这能减少拼写错误，同时不改变运行语义。
+\paragraph{第一，路径同一性判断仍是词法近似。}
+当前实现能防止常见的同一路径误用，但不能完整识别硬链接、符号链接和平台路径别名。若未来需要更强保护，
+应使用平台文件身份信息。
 
-\paragraph{第二，JSON 报告还没有 schema。}
-当前 JSON 字段很少，手写输出足够。但若报告扩展为性能遥测、设备信息或 per-testcase 明细，
-应定义稳定 schema，并为字段增加版本策略。否则下游脚本会被文本细节绑架。
+\paragraph{第二，JSON 输出没有 schema。}
+字段很少时手写 JSON 可以接受；如果报告扩展到设备信息、每 testcase 明细或 profiling 数据，就应定义稳定 schema、
+版本字段和字符串转义策略。
 
-\paragraph{第三，路径同一性判断仍是词法近似。}
-当前实现已防止最常见的输入输出相同路径问题，但不是完整文件身份判断。若未来面向复杂 Windows 路径、
-符号链接或网络文件系统，应把路径比较升级为平台文件 ID 比较。
+\paragraph{第三，选项定义表尚未生成 shell completion。}
+由于所有选项已经集中在 \texttt{definitions\_}，未来可以从同一张表生成 Bash、Zsh 或 PowerShell 补全脚本
+（shell completion），减少拼写错误。
 
 \paragraph{第四，配置来源只有命令行。}
-这保持了可复现性：完整实验配置可以被一个命令行记录下来。若未来加入配置文件，应明确优先级：
+这对可复现性是好事：完整实验配置可以被一条命令记录。若未来加入配置文件，应明确优先级：
 \[
-    \text{default} \prec \text{config file} \prec \text{CLI override}.
+    \text{default}\prec \text{config file}\prec \text{CLI override},
 \]
-并提供 dry-run 展示合并后的最终配置，否则用户很难判断真实执行参数。
+并继续提供 dry-run 展示合并后的最终配置。
 
-\paragraph{第五，错误输出没有结构化模式。}
-当前错误写入 \texttt{stderr}，适合人类读取。若该工具进入自动化平台，可以考虑提供
-\texttt{--error-format json}，但必须保持默认错误简洁，不能让普通终端用户为机器接口付出复杂度。
+\paragraph{第五，性能报告仍是摘要，不是完整遥测。}
+当前报告包含总耗时、sweep 总数和布局调优结果，但没有每阶段耗时、队列阻塞、重排序缓冲区峰值或 GPU kernel
+分项时间。若要做严肃 profiling，应新增独立 telemetry 结构，而不是把稳定用户报告变成调试日志。
 
 \subsection{小结}
 
-\texttt{main.cpp} 的设计可以概括为一条形式化边界：
+当前 \texttt{main.cpp} 可以形式化为一条边界清楚的转换链：
 \[
 \begin{aligned}
     argv
     &\xrightarrow{\text{parse}}
     \texttt{ParseResult}
-    \xrightarrow{\text{validate}}
-    \texttt{CliOptions}
-    \xrightarrow{\Phi}
-    \texttt{PipelineConfig} \\
-    &\xrightarrow{\text{run}}
+    \xrightarrow{\text{normalize/validate}}
+    \texttt{CliOptions} \\
+    &\xrightarrow{\Phi}
+    \texttt{PipelineConfig}
+    \xrightarrow{\text{run}}
     \texttt{PipelineReport}
     \xrightarrow{\Pi}
     \text{stdout/stderr/exit code}.
 \end{aligned}
 \]
-它把非结构化字符串转化为结构化配置，把用户错误与执行错误分离，把人类可读报告与机器可读报告分离，
+它把非结构化字符串转化为结构化配置，把用户错误与执行错误分离，把覆盖风险变成显式选择，把布局转置性能策略暴露为可记录参数，
 并在进入昂贵的 I/O 与 GPU 计算之前尽可能早地拒绝无效输入。
 
-从系统论文的视角看，这一章的关键不是某个选项如何拼写，而是 CLI 层建立了“意图编译器”
-（intent compiler）：用户给出的命令被解析、归一化、验证，并最终降阶为 pipeline 可以理解的最小执行契约。
-这种设计让 \texttt{pipeline.cpp} 保持纯粹，让 \texttt{io.cpp} 与 \texttt{kernels.cu} 不受 UI 噪声污染，
-也让未来的脚本化实验拥有稳定边界。
+从系统论文的视角看，本章的重点不是某个选项如何拼写，而是 CLI 层建立了一个可审计的意图编译器。
+用户给出的命令先被解析、归一化、验证，再降阶为 pipeline 可以理解的最小执行契约。这样
+\texttt{pipeline.cpp} 可以专心做应用调度，\texttt{io.cpp} 可以专心做矩阵流，
+\texttt{kernels.cu} 可以专心做数值计算。
 
-小而清楚的入口，比宏大而暧昧的框架更可靠。对于一个 CUDA 数值系统而言，真正的工程品味并不只在 kernel
-的浮点吞吐里，也在 \texttt{main.cpp} 这种安静的入口代码里：它决定错误在哪里被发现，配置如何被记录，
-用户脚本是否能长期运行，以及系统是否能在变复杂之前仍然保持可理解。
+小而清楚的入口，比宏大而暧昧的框架更可靠。对于 CUDA 数值系统而言，工程品味不只在 kernel 的浮点吞吐里，
+也在 \texttt{main.cpp} 这种安静的入口代码里：它决定错误在哪里被发现，配置如何被记录，实验脚本是否能长期运行，
+以及系统是否能在变复杂之前仍然保持可理解。
