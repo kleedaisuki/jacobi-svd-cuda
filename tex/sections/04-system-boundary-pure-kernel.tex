@@ -49,6 +49,25 @@ GPU kernel 同时承受三类复杂性。
 在真实演化中会迅速失控：文件格式变化影响 kernel，命令行变化影响 kernel，输出顺序变化影响 kernel，
 最终最难验证的一层承担了最多责任。
 
+这就是反向依赖（reverse dependency）的坏味道：越接近数学核心的代码，越不应该认识越外层的世界。
+为了让边界足够锋利，需要把 kernel 不该知道的东西说清楚：
+
+\begin{itemize}
+    \item \textbf{不认识文件格式。} \texttt{kernels.cu} 不解析 \texttt{*.mat} 的网络字节序头部，
+          也不解析 \texttt{*.txt} 中的空格、换行和空行；
+    \item \textbf{不认识路径与构建产物。} 输入路径、输出路径、父目录创建、CMake 生成器、
+          \texttt{nvcc} driver mode 与 artifact 位置都不应影响 SVD 语义；
+    \item \textbf{不认识用户意图。} \texttt{--epsilon}、\texttt{--max-sweeps}
+          等命令行拼写在进入 kernel 前应已变成类型化配置；
+    \item \textbf{不认识端到端调度。} testcase index、线程池（thread pool）、future 窗口、
+          重排序缓冲区（reorder buffer）、完成队列和输出顺序都属于应用层；
+    \item \textbf{不拥有长期系统资源。} 文件句柄、映射视图、输出线程、完成队列和 CLI 报告格式
+          都不属于 kernel。
+\end{itemize}
+
+这组否定边界不是装饰性的架构洁癖，而是在保护高性能代码最稀缺的东西：可定位性。
+kernel 的尊严来自克制。它不处理世界，它只处理矩阵。
+
 良构边界（well-formed boundary）的目标不是把代码切成漂亮图层，而是降低变化传播
 （change propagation）。理想情况下：
 \[
@@ -98,18 +117,52 @@ GPU kernel 同时承受三类复杂性。
 只是让这个核心进入现实世界的外层机制。
 
 因此，本项目采用的是轻量 DDD：只保留“领域核心、应用编排、基础设施、表示层”
-这些边界思想，不强行引入完整战术模式。当前结构可以理解为：
+这些边界思想，不强行引入完整战术模式。它真正关心的是依赖方向（dependency direction）：
 \[
     \begin{array}{ccl}
-        \text{Presentation}   & : & \texttt{main.cpp}\quad \text{把用户字符串编译成配置};       \\
-        \text{Application}    & : & \texttt{pipeline.cpp}\quad \text{编排输入、计算、输出与并发}; \\
-        \text{Domain Core}    & : & \texttt{kernels.cu}\quad \text{执行单矩阵 SVD 数值变换};  \\
-        \text{Infrastructure} & : & \texttt{io.cu}\quad \text{处理矩阵流、字节、平台资源}.
+        \texttt{main.cpp}
+         & \longrightarrow &
+        \texttt{pipeline.cpp}
+         \longrightarrow
+        \{\texttt{io.cu},\texttt{kernels.cu}\}.
     \end{array}
 \]
-注意这里使用 \texttt{io.cu}，因为当前 I/O 层已经包含 \texttt{cudaMallocHost} 管理的
-页锁定主机缓冲区（pinned host buffer）。它仍然是基础设施层，而不是算法层；
-文件、字节序、pinned staging 和文本兼容格式都属于数据进入系统的边界工作。
+也就是说，表示层（presentation layer）把用户字符串编译成配置；应用层（application layer）
+把一次用例编排成读入、计算、写出；基础设施层（infrastructure layer）把外部字节变成矩阵流；
+领域核心（domain core）只执行单矩阵 SVD 数值变换。外层知道内层，内层不反向知道外层。
+\texttt{io.cu} 与 \texttt{kernels.cu} 在应用层之下并列：前者负责数据进入系统，
+后者负责数值核心计算，二者不应相互依赖。kernel 不读取文件；I/O 不执行 SVD；
+pipeline 才是把它们组合成用例的地方。
+
+把这个方向压缩成公式，就是：
+\[
+    \text{System}
+    =
+    \text{Adapters}
+    \circ
+    \text{Application Use Case}
+    \circ
+    \text{Domain Kernel}.
+\]
+这里的 \(\circ\) 不是单纯函数复合，而是责任边界的复合：每层只把下一层需要的最小信息传过去。
+
+围绕这个方向，良构系统应长期保持几条不变量（invariant）：
+
+\begin{itemize}
+    \item 领域核心只依赖内存中的类型化数据，不接收路径、文件句柄、原始字节流或 CLI 字符串；
+    \item 公开结果不暴露设备资源，\texttt{JacobiSvdResult} 不返回 device pointer、stream、
+          event 或临时缓冲区；
+    \item 应用层只编排用例，不复制 Jacobi 旋转公式，也不重写 SVD 后处理逻辑；
+    \item 基础设施层可以选择 \texttt{*.mat}、文本、mmap 或 pinned host buffer，
+          但不能改变 \(\epsilon\)、最大 sweep 数、列对调度或奇异值语义；
+    \item 表示层只能生成配置并调用 pipeline，不能为了方便直接读文件、写矩阵或调用内部 kernel helper；
+    \item 错误在边界被翻译，而不是在深处格式化给用户；
+    \item 并发不改变输出契约，线程池可以让 testcase 乱序完成，但输出文件仍必须按输入顺序写出；
+    \item 构建 artifact 不改变运行语义，同一输入、同一配置和同一源码应暴露相同应用层契约。
+\end{itemize}
+
+这些不变量把 DDD 从“分层名词表”变成了可检查的工程纪律。换句话说，小可爱 Klee，
+这里的 DDD 不是给代码穿西装，而是给数值核心画防火线。
 
 \subsection{Kernel 的公开契约：窄入口，类型化配置，主机侧结果}
 
@@ -173,229 +226,79 @@ kernel launch 和 \texttt{cudaDeviceSynchronize}；外部看到的是
 \]
 副作用被收束在窄边界内，接口语义因此接近数学函数。
 
-\subsection{布局转置与自动调优：策略可以变化，契约不能变化}
+\subsection{外层支撑：让纯 kernel 落到真实系统}
 
-上一章已经说明：外部契约保持行主序，但单边雅可比天然按列访问。
-当前 kernel 层因此提供两条内部路径：
+kernel 的契约只覆盖单张矩阵的数值变换，但程序要跑起来，还需要外层把“脏世界”整理成
+kernel 能接受的形状。表示层、应用层和基础设施层的共同价值，不是替 kernel 做数学，
+而是给 kernel 提供干净输入、稳定调度、可解释输出和受控资源。
 
-\begin{itemize}
-    \item 直接路径：工作矩阵 \(A\) 保持行主序，列访问带有跨步；
-    \item 布局转置路径：先在 GPU 上把 \(A\) 转为列主序工作区，再执行 sweep，收敛后转回行主序。
-\end{itemize}
-
-系统边界上最重要的不是“某条路径一定更快”，而是两条路径必须拥有同一公开契约。
-无论 \texttt{LayoutTransposeMode} 是 \texttt{force\_enable}、\texttt{force\_disable}
-还是 \texttt{auto\_select}，调用者最终都得到同形状、同行主序、同语义的 \(U,\Sigma,V\)。
-布局是实现策略，不是外部 ABI。
-
-自动调优（auto-tuning）进一步加强了这个边界意识。函数
-\[
-    \begin{aligned}
-        \texttt{auto\_tune\_layout\_transpose\_threshold}:
-         & \quad \texttt{JacobiSvdConfig}                               \\
-         & \quad \longrightarrow \texttt{LayoutTransposeAutoTuneReport}
-    \end{aligned}
-\]
-执行一组确定性微基准，返回推荐阈值、样本数与估计加速比。它不修改全局状态，也不偷偷改变用户配置。
-当前 pipeline 的做法是：在正式读取输入流和提交线程池任务之前，若用户启用自动调优且模式为
-\texttt{auto\_select}，就先运行一次调优，把推荐阈值写入本次运行的
-\[
-    C_{\mathrm{runtime}}.
-\]
-随后关闭该配置中的自动调优标志，避免 worker 线程重复执行微基准。
-
-这个顺序很有品味。自动调优是运行前配置归一化，不是每个 testcase 自己执行的隐式副作用。
-如果把调优放进工作任务内部，就会出现重复 benchmark、设备争用、报告不可解释等问题。
-现在的结构则保持了清晰关系：
-\[
-    \text{user config}
-    \xrightarrow{\text{optional pre-run tuning}}
-    \text{runtime config}
-    \xrightarrow{\text{kernel calls}}
-    \text{results}.
-\]
-调优改变执行策略，但不改变 SVD 的外部语义。
-
-\subsection{反向依赖是坏味道：kernel 不应该认识世界}
-
-为了让边界足够锋利，需要明确列出 kernel 不应该知道的东西。
-
-\begin{itemize}
-    \item \textbf{不认识文件格式。} \texttt{kernels.cu} 不解析 \texttt{*.mat} 的网络字节序头部，
-          也不解析 \texttt{*.txt} 中的空格、换行和空行；
-    \item \textbf{不认识路径。} 输入路径、输出路径、父目录创建和覆盖策略都属于 CLI、pipeline 与 I/O；
-    \item \textbf{不认识输出顺序。} \(U,\Sigma,V\) 如何被写为三张矩阵、乱序完成如何恢复顺序，
-          是 pipeline 的职责；
-    \item \textbf{不认识线程池。} 全局线程池（global thread pool）、future 窗口和重排序缓冲区
-          （reorder buffer）服务于跨 testcase 调度，不属于单矩阵 SVD；
-    \item \textbf{不认识用户意图。} \texttt{--epsilon}、\texttt{--max-sweeps}、
-          \texttt{--layout-transpose} 在进入 kernel 前应已转化为类型化配置；
-    \item \textbf{不认识构建系统。} \texttt{nvcc} driver mode、CMake CUDA language、
-          输出 artifact 路径都不应影响运行时 SVD 语义；
-    \item \textbf{不拥有长期系统资源。} 文件句柄、映射视图、输出线程、完成队列和 CLI 报告格式
-          都不属于 kernel。
-\end{itemize}
-
-这组否定边界看似啰嗦，但它们能阻止架构坍缩。系统设计经常不是靠“应该做什么”保持清楚，
-而是靠“绝不做什么”防止职责膨胀。对本项目而言，kernel 的尊严来自克制：
-它不处理世界，它只处理矩阵。
-
-\subsection{应用层：Pipeline 是用例协议，不是更大的 kernel}
-
-\texttt{pipeline.cpp} 位于应用层（application layer）。它的职责不是实现 SVD，
-而是组织一次完整用例（use case）：
-\[
-    \text{read testcase}
-    \longrightarrow
-    \text{compute SVD}
-    \longrightarrow
-    \text{write result}.
-\]
-但当前实现已经不再是简单的“主线程读、主线程算、写线程写”。新的 pipeline 包含：
 \[
     \begin{gathered}
-        \text{single-cursor dispatch}
+        argv
         \longrightarrow
-        \text{global thread pool}
+        \texttt{PipelineConfig}
         \longrightarrow
-        \text{kernel stage} \\
+        \text{matrix stream} \\
         \longrightarrow
-        \text{completion queue}
+        \texttt{JacobiSvdResult}
         \longrightarrow
-        \text{reorder buffer}
-        \longrightarrow
-        \text{single writer}.
+        \text{output stream}.
     \end{gathered}
 \]
 
-这套结构回答的是系统问题，而不是数学问题。不同 testcase 可以并发解码和计算；
-完成顺序可以乱序；输出文件必须仍然按输入序写出
+\texttt{main.cpp} 承担意图编译器（intent compiler）的角色。它把命令行字符串解析成 pipeline 配置
+和 kernel 配置，并在进入应用层前完成默认值归一化与基本验证。
+它的产物应该是类型化配置，而不是一次偷偷的文件读取或 kernel launch。
+
+\texttt{io.cu} 承担输入输出适配器（I/O adapter）的角色：它把 \texttt{*.mat}、文本格式、
+字节序、内存映射和页锁定主机缓冲区（pinned host buffer）封装在边界内，
+向上交付 \texttt{io::Matrix} 或带序号的派发任务。它可以让数据更适合高吞吐流动，
+但不能决定 SVD 的数值语义，也不能把文件映射地址直接塞给 kernel。
+
+\texttt{pipeline.cpp} 承担用例协议（use-case protocol）的角色：它把输入、计算、输出组合成一次端到端执行，
+负责 testcase 序号、线程池（thread pool）、future 窗口、重排序缓冲区（reorder buffer）、
+背压（backpressure）和跨线程异常传播。它可以让多个 testcase 并发完成，
+但必须保持输出契约：
 \[
     (U_0,\Sigma_0,V_0),
     (U_1,\Sigma_1,V_1),
     \ldots
 \]
-于是 pipeline 需要序号、future、完成队列、重排序缓冲区、背压（backpressure）和跨线程异常传播。
-这些机制都不改变 Jacobi 旋转公式，但它们决定端到端程序是否可靠。
+仍按输入顺序写出。
 
-从边界角度看，pipeline 拥有的是执行顺序，而不是内部语义：
-
-\begin{itemize}
-    \item 它可以决定何时执行布局转置自动调优，但不实现转置 kernel；
-    \item 它可以验证 testcase 的基本形状，但不实现 Jacobi 旋转；
-    \item 它可以把 \texttt{JacobiSvdResult} 重组为三张 \texttt{io::Matrix}，
-          但不改变 \(U,\Sigma,V\) 的数学含义；
-    \item 它可以用重排序缓冲区恢复输出顺序，但不让 kernel 认识 testcase index。
-\end{itemize}
-
-这就是应用层聚合根（aggregate root）的意义：它把多个对象组合成一个端到端执行边界，
-同时不偷走每一层自己的职责。pipeline 是用例协议，不是更大的 kernel。
-
-\subsection{基础设施层：把脏世界封装在 I/O 边界}
-
-\texttt{io.cu} 处理的是基础设施层（infrastructure layer）问题：文件、字节序、文本解析、
-内存映射、平台 API、页锁定主机缓冲区和矩阵流 policy。这些问题非常重要，但它们不是 SVD 的领域语义。
-
-当前 I/O 层提供两类入口。
-
-\paragraph{第一，传统矩阵流。}
+因此，外层三件事合起来给 kernel 提供的是一个降噪通道：
 \[
-    \texttt{MatInputStream},\quad
-    \texttt{TxtInputStream},\quad
-    \texttt{MatOutputStream},\quad
-    \texttt{TxtOutputStream}.
+    \begin{gathered}
+        \text{external bytes and user strings}
+        \xrightarrow{\text{parse, validate, schedule}}
+        \text{typed host matrices and configs} \\
+        \xrightarrow{\text{kernel}}
+        \text{typed numerical results}
+        \xrightarrow{\text{order, encode, report}}
+        \text{user-visible artifacts}.
+    \end{gathered}
 \]
-它们围绕 \texttt{io::Matrix} 工作：
-\[
-    \texttt{Matrix}=(rows,columns,values).
-\]
-这一接口适合简单路径、文本调试和兼容 API。policy-based design 让二进制格式与文本格式共享流控制，
-而把具体编码策略隔离在 policy 中。
+这就是它们在系统设计中的职能：把现实世界的不稳定性吸收在外层，让 kernel 面对尽可能稳定、
+尽可能窄的数学接口。
 
-\paragraph{第二，高吞吐派发路径。}
-\texttt{MatDispatchReader} 读取 \texttt{*.mat} 记录，并产生：
-\[
-    \texttt{MatDispatchTask}
-    =
-    (\texttt{sequence\_index},\texttt{rows},\texttt{columns},\texttt{buffer}).
-\]
-其中 \texttt{buffer} 是 \texttt{PinnedHostTaskBuffer}，由 \texttt{cudaMallocHost}/
-\texttt{cudaFreeHost} 管理一块连续页锁定主机内存。输入区保存原始网络序 payload，
-工作区为后续解析或 staging 预留空间。该路径让主线程保留单游标读取权，
-同时把解码和计算移交给线程池任务。
+\subsection{健壮性要求：所有权清楚，失败可翻译}
 
-这里需要保持清醒：pinned memory 仍然不是 device memory。I/O 层可以管理适合高速派发的主机缓冲，
-但它不启动 kernel，不分配 \texttt{DeviceMatrix}，不管理 CUDA stream，也不决定布局转置策略。
-它只是把外部字节转化为系统内部稳定任务或矩阵：
-\[
-    \text{external bytes}
-    \longrightarrow
-    \texttt{MatDispatchTask}
-    \longrightarrow
-    \texttt{io::Matrix}
-    \longrightarrow
-    \text{kernel input}.
-\]
-每个箭头都属于不同边界。把它们揉在一起，短期可能少几行代码，长期一定增加生命周期耦合。
+边界要真正可依赖，只靠“分层”不够；资源所有权和错误语义也必须落到代码上。
+资源获取即初始化（Resource Acquisition Is Initialization, RAII）在这里不是 C++ 技巧，
+而是系统健壮性（robustness）的基本要求：谁申请资源，谁负责释放；资源生命周期不能漂移到不该认识它的层。
 
-\subsection{表示层：CLI 是意图编译器}
-
-\texttt{main.cpp} 位于表示层（presentation layer）。它面对的是字符串：
-\[
-    argv=(a_0,a_1,\ldots,a_{n-1}).
-\]
-这些字符串本身没有领域意义。只有经过解析、类型转换、默认值归一化和跨字段验证后，
-它们才变成应用层配置：
-\[
-    argv
-    \longrightarrow
-    \texttt{CliOptions}
-    \longrightarrow
-    \texttt{PipelineConfig}
-    \longrightarrow
-    \texttt{JacobiSvdConfig}.
-\]
-
-因此，CLI 可以被看成意图编译器（intent compiler）。用户表达“我要对这个文件做 SVD，
-用这个收敛阈值，按这个格式写出结果”，CLI 把这句话降阶为 pipeline 能执行的配置。
-它不应该直接读取矩阵文件，不应该启动 CUDA kernel，也不应该自己写 \(U,\Sigma,V\)。
-
-这种边界带来一个朴素但强大的性质：用户接口可以变化，应用核心不必变化。
-未来加入 \texttt{--dry-run}、\texttt{--device}、\texttt{--profile}
-或 shell completion，
-只要最终仍然生成稳定的 \texttt{PipelineConfig}，pipeline 与 kernel 就不需要知道用户使用了哪种表面语法。
-
-\subsection{资源所有权：RAII 是边界纪律，不只是 C++ 技巧}
-
-资源获取即初始化（Resource Acquisition Is Initialization, RAII）在本项目中不只是 C++ 写法偏好，
-而是边界纪律。它回答一个非常实际的问题：谁负责释放什么，什么时候释放，失败路径是否泄漏。
-
-当前系统中至少有这些资源所有者：
-
-\begin{itemize}
-    \item \texttt{DeviceMatrix} 拥有设备矩阵内存；
-    \item 匿名命名空间中的 \texttt{DeviceBuffer<T>} 拥有临时设备数组；
-    \item \texttt{MatReader} 与 \texttt{MatWriter} 拥有文件映射、句柄与映射视图；
-    \item \texttt{PinnedHostTaskBuffer} 拥有页锁定主机内存；
-    \item \texttt{ReorderBufferOutputStage} 拥有写线程、完成队列和关闭协议；
-    \item 全局线程池拥有 worker 线程与任务队列。
-\end{itemize}
-
-每个资源都应有唯一所有者（unique owner）：
+当前系统中，设备矩阵对象拥有设备内存；读写器拥有文件映射和句柄；
+pinned buffer 拥有页锁定主机内存；输出阶段和全局线程池拥有线程、队列与关闭协议。
+每个资源都应满足唯一所有者（unique owner）关系：
 \[
     \operatorname{owner}(r)=o,
     \qquad
     \operatorname{lifetime}(r)\subseteq\operatorname{lifetime}(o).
 \]
-这条关系能消除许多 CUDA/C++ 混合程序中的经典错误：重复释放、早释放、异常路径泄漏、
+这条纪律消除的是 CUDA/C++ 混合程序里最毒的故障：重复释放、早释放、异常路径泄漏、
 线程未 join、映射视图悬垂、device pointer 漂移到上层。
 
-RAII 与纯函数式外观并不矛盾。恰恰相反，正因为内部副作用由 RAII 对象管理，
-外部接口才可以表现得更接近函数。资源纪律越清楚，函数式边界越可信。
-
-\subsection{错误边界：把失败翻译成上层能理解的语言}
-
-系统中的错误来源可以分成几类：
+错误边界同样要清楚。系统错误可以粗分为：
 \[
     E =
     E_{\mathrm{cli}}
@@ -408,7 +311,7 @@ RAII 与纯函数式外观并不矛盾。恰恰相反，正因为内部副作用
     \cup
     E_{\mathrm{build}}.
 \]
-这些错误不应混成一团。CLI 参数错误应在运行前报告；I/O 格式错误应指出记录边界或维度问题；
+CLI 参数错误应在运行前报告；I/O 格式错误应指出记录边界或维度问题；
 CUDA runtime 错误应保留底层诊断；pipeline 错误应说明并发阶段、输出缺包或线程异常；
 构建错误应停留在 CMake 或编译器层。
 
@@ -425,12 +328,8 @@ kernel 层尤其需要错误翻译（error translation）。CUDA API 返回 \tex
 \]
 达到 \texttt{max\_sweeps} 仍未完全收敛，是数值算法状态；\texttt{cudaMalloc}、
 kernel launch 或 \texttt{cudaMemcpy} 失败，是运行时系统状态。前者适合进入计算报告或验证指标，
-后者通常应终止当前任务并传播诊断。把二者都叫“kernel failed”会遮蔽真正原因。
-
-pipeline 层则负责跨线程错误传播。工作任务异常通过 \texttt{future.get()} 回到主线程；
-写线程异常保存在输出阶段的异常指针中，并通过 \texttt{submit} 或关闭路径重抛。
-因此，只要任一线程认为本次输出不可信，\texttt{JacobiSvdPipeline::run()} 就不能报告成功。
-这就是 fail-fast 语义：宁可明确失败，也不要产出静默污染的实验文件。
+后者通常应终止当前任务并传播诊断。pipeline 再把 worker 异常、写线程异常和关闭路径异常汇总回
+\texttt{JacobiSvdPipeline::run()}。只要任一阶段认为本次输出不可信，就不能报告成功。
 
 \subsection{数据结构边界：同名“矩阵”不是同一种东西}
 
@@ -453,15 +352,17 @@ pipeline 层则负责跨线程错误传播。工作任务异常通过 \texttt{fu
 
 正确的数据流是逐层降噪：
 \[
-    \text{file bytes}
-    \xrightarrow{\text{decode or dispatch}}
-    \text{host matrix}
-    \xrightarrow{\text{copy}}
-    \text{device matrix}
-    \xrightarrow{\text{compute}}
-    \text{host result}
-    \xrightarrow{\text{encode}}
-    \text{file bytes}.
+    \begin{gathered}
+        \text{file bytes}
+        \xrightarrow{\text{decode or dispatch}}
+        \text{host matrix}
+        \xrightarrow{\text{copy}}
+        \text{device matrix} \\
+        \xrightarrow{\text{compute}}
+        \text{host result}
+        \xrightarrow{\text{encode}}
+        \text{file bytes}.
+    \end{gathered}
 \]
 其中 \texttt{*.mat} 高吞吐路径把第一段细化为：
 \[
@@ -472,75 +373,6 @@ pipeline 层则负责跨线程错误传播。工作任务异常通过 \texttt{fu
     \texttt{io::Matrix}.
 \]
 复杂性没有消失，但它被放到了可定位的位置。
-
-\subsection{良构系统的不变量}
-
-围绕纯函数式 kernel，可以列出本项目希望长期保持的一组系统不变量。
-
-\paragraph{不变量一：领域核心只依赖内存中的类型化数据。}
-kernel 入口不接收路径、文件句柄、原始字节流或 CLI 字符串。所有外部输入必须先被解析为维度明确、
-元素类型明确、布局明确的矩阵对象。
-
-\paragraph{不变量二：公开结果不暴露设备资源。}
-\texttt{JacobiSvdResult} 返回主机侧值，不返回 device pointer、stream、event 或临时缓冲区。
-上层可以移动、序列化和测试结果，但不能管理 kernel 内部资源。
-
-\paragraph{不变量三：应用层只编排，不重写领域逻辑。}
-pipeline 可以决定何时读、何时调优、何时提交线程池、何时写出和如何处理背压；
-但不能复制 Jacobi 旋转公式，也不能手写 SVD 后处理逻辑。
-
-\paragraph{不变量四：基础设施层不决定算法语义。}
-I/O 层可以选择 \texttt{*.mat} 或文本格式，可以使用 mmap、普通流或 pinned host buffer；
-但不能改变 \(\epsilon\)、最大 sweep 数、列对调度或奇异值语义。
-
-\paragraph{不变量五：表示层不越过应用层。}
-CLI 只能生成配置并调用 pipeline。任何为了方便而在 \texttt{main.cpp} 中直接读文件、
-写矩阵或调用内部 kernel helper 的做法，都应视为架构回归。
-
-\paragraph{不变量六：错误在边界被翻译，而不是在深处格式化给用户。}
-底层错误应携带诊断信息向上传播，由合适层决定用户可见表达。
-kernel 不打印用户帮助，I/O 不决定进程退出码，pipeline 不解析命令行。
-
-\paragraph{不变量七：并发不改变输出契约。}
-线程池可以让 testcase 乱序完成，但输出文件仍必须按输入顺序写出
-\((U_i,\Sigma_i,V_i)\)。重排序缓冲区是应用层机制，不是数学层机制。
-
-\paragraph{不变量八：构建 artifact 不改变运行语义。}
-CMake 可以选择 nvcc driver mode 或 CMake CUDA language 路径；同一输入、同一配置和同一源码
-应暴露相同应用层契约。性能可能变化，语义不应变化。
-
-\subsection{从模块图到依赖方向}
-
-把上述思想压缩为依赖图，可以得到：
-\[
-    \begin{array}{ccccc}
-        \texttt{main.cpp}
-         & \longrightarrow &
-        \texttt{pipeline.cpp}
-         & \longrightarrow &
-        \{\texttt{io.cu},\texttt{kernels.cu}\}.
-    \end{array}
-\]
-这张图有两个关键含义。
-
-第一，\texttt{io.cu} 与 \texttt{kernels.cu} 在应用层之下并列。
-它们分别处理数据进入系统和数值核心计算，二者不应相互依赖。
-kernel 不读取文件；I/O 不执行 SVD。pipeline 是把它们组合成用例的地方。
-
-第二，依赖方向从用户意图到应用用例，再到具体能力。外层知道内层，内层不反向知道外层。
-越靠近数学核心，变化频率应越低；越靠近用户和平台，变化频率可以越高。
-可以用更抽象的公式表达：
-\[
-    \text{System}
-    =
-    \text{Adapters}
-    \circ
-    \text{Application Use Case}
-    \circ
-    \text{Domain Kernel}.
-\]
-这里的 \(\circ\) 不是单纯函数复合，而是责任边界的复合：
-每层只把下一层需要的最小信息传过去。
 
 \subsection{当前实现的边界风险}
 
