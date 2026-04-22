@@ -1,0 +1,94 @@
+\begingroup
+    \small
+    \setlength{\tabcolsep}{4pt}
+    \renewcommand{\arraystretch}{1.12}
+    \begin{xltabular}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.12\linewidth}>{\raggedright\arraybackslash}p{0.29\linewidth}>{\raggedright\arraybackslash}p{0.12\linewidth}>{\raggedright\arraybackslash}X@{}}
+        \caption{当前 CLI 命令面与选项契约}
+        \label{tab:cli-command-surface}\\
+        \toprule
+        类别 & 选项或形式 & 参数 & 语义 \\
+        \midrule
+        \endfirsthead
+
+        \multicolumn{4}{@{}l}{表~\thetable（续）当前 CLI 命令面与选项契约}\\
+        \toprule
+        类别 & 选项或形式 & 参数 & 语义 \\
+        \midrule
+        \endhead
+
+        \midrule
+        \multicolumn{4}{r@{}}{续下页}\\
+        \endfoot
+
+        \bottomrule
+        \endlastfoot
+
+        命令形式
+        & \texttt{<input> [output]}\newline
+          \texttt{--}
+        & 路径或无
+        & \texttt{<input>} 必填；\texttt{[output]} 省略时默认写入输入目录，文件名为 \texttt{<input-stem>.svd.<ext>}。
+          显式 \texttt{--input}/\texttt{--output} 优先；\texttt{--} 之后 token 全按位置参数处理；多余位置参数报错。 \\
+
+        数据边界
+        & \texttt{--input}/\texttt{-i}\newline
+          \texttt{--output}/\texttt{-o}
+        & \texttt{PATH}
+        & 输入路径必须存在且为文件；输出路径不能是目录，且规范化后不得与输入路径相同。
+          输出已存在时必须显式给出 \texttt{--force}/\texttt{-y}。 \\
+
+        格式契约
+        & \texttt{--input-format}\newline
+          \texttt{--output-format}\newline
+          \texttt{--format}/\texttt{-f}
+        & \texttt{FMT}
+        & \texttt{FMT=auto|mat|txt}。\texttt{--format} 同时设置输入与输出格式。
+          输入格式为 \texttt{auto} 且扩展名不可推断时直接报错；输出格式为 \texttt{auto} 时按“显式输入格式 $\rightarrow$ 输入扩展名 $\rightarrow$ \texttt{mat}”回退，并在缺失扩展名时自动补齐标准后缀。 \\
+
+        数值配置
+        & \texttt{--epsilon}/\texttt{-e}\newline
+          \texttt{--max-sweeps}/\texttt{-s}\newline
+          \texttt{--threads-per-block}/\texttt{-t}
+        & \texttt{NUM}/\texttt{N}
+        & 三项都要求正数（其中 \texttt{max-sweeps} 与 \texttt{threads-per-block} 为正整数）。
+          默认值分别为 \texttt{1e-9}、\texttt{128}、\texttt{256}。 \\
+
+        布局策略
+        & \texttt{--layout-transpose-}\newline
+          \texttt{mode|min-cols|}\newline
+          \texttt{min-elems}
+        & \texttt{MODE}/\texttt{N}
+        & 选项族表达（family notation）：按“前缀 + 后缀”展开为完整选项。
+          \texttt{MODE=auto|on|off}。
+          两个阈值都要求正数，主要用于 \texttt{auto} 模式决策；默认值为 \texttt{auto}、\texttt{16}、\texttt{4096}。 \\
+
+        自动调优
+        & \texttt{--layout-transpose-}\newline
+          \texttt{auto-tune|}\newline
+          \texttt{bench-reps|}\newline
+          \texttt{bench-sweeps}
+        & 无或 \texttt{N}
+        & 选项族表达（family notation）：按“前缀 + 后缀”展开为完整选项。
+          开启后在 pipeline 前运行微基准自动调阈值；
+          \texttt{bench-reps}/\texttt{bench-sweeps} 要求正整数，默认 \texttt{2}/\texttt{8}。
+          仅当 \texttt{mode=auto} 时该调优实际生效，并用推荐值覆盖本次运行阈值。 \\
+
+        运行控制
+        & \texttt{--queue-capacity}/\texttt{-c}\newline
+          \texttt{--force}/\texttt{-y}\newline
+          \texttt{--dry-run}\newline
+          \texttt{--print-config}
+        & \texttt{N} 或无
+        & \texttt{queue-capacity} 要求正整数，默认 \texttt{4}；\texttt{--force} 允许覆盖已有输出。
+          \texttt{--dry-run} 只做参数校验并打印有效配置后退出（不执行 pipeline）；\texttt{--print-config} 会先打印配置再继续执行。 \\
+
+        报告与动作
+        & \texttt{--json-report}\newline
+          \texttt{--quiet}/\texttt{-q}\newline
+          \texttt{--help}/\texttt{-h}\newline
+          \texttt{--version}/\texttt{-v}
+        & 无
+        & \texttt{--quiet} 仅抑制文本报告；\texttt{--json-report} 额外输出 JSON，二者可组合得到纯机器可读输出。
+          \texttt{--help}/\texttt{--version} 属于动作命令：直接输出并以退出码 \texttt{0} 返回，不进入运行配置校验与 pipeline 执行。 \\
+    \end{xltabular}
+\endgroup
