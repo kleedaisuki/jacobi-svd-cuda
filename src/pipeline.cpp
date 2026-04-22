@@ -7,7 +7,6 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstddef>
-#include <deque>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -19,7 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -289,10 +288,13 @@ namespace jacobi::svd::pipeline
              * @return 任务 future；Task future.
              */
             template <typename Callable>
-            [[nodiscard]] std::future<void> submit(Callable &&callable)
+            [[nodiscard]] auto submit(Callable &&callable) -> std::future<std::invoke_result_t<std::decay_t<Callable>>>
             {
-                auto packaged_task = std::make_shared<std::packaged_task<void()>>(std::forward<Callable>(callable));
-                std::future<void> result = packaged_task->get_future();
+                using ResultType = std::invoke_result_t<std::decay_t<Callable>>;
+
+                auto packaged_task =
+                    std::make_shared<std::packaged_task<ResultType()>>(std::forward<Callable>(callable));
+                std::future<ResultType> result = packaged_task->get_future();
 
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -393,9 +395,9 @@ namespace jacobi::svd::pipeline
         }
 
         /**
-         * @brief 带重排序缓冲区的异步写出阶段；Asynchronous output stage with reorder buffer.
+         * @brief 基于 future 队列的异步写出阶段；Asynchronous output stage based on a future queue.
          */
-        class ReorderBufferOutputStage final
+        class FutureQueueOutputStage final
         {
         public:
             /**
@@ -404,18 +406,18 @@ namespace jacobi::svd::pipeline
              * @param format 输出格式；Output format.
              * @param queue_capacity 完成队列容量；Completion queue capacity.
              */
-            ReorderBufferOutputStage(const std::filesystem::path &output_path,
-                                     MatrixFileFormat format,
-                                     std::size_t queue_capacity)
+            FutureQueueOutputStage(const std::filesystem::path &output_path,
+                                   MatrixFileFormat format,
+                                   std::size_t queue_capacity)
                 : queue_capacity_(std::max<std::size_t>(queue_capacity, 1)),
-                  consumer_thread_(&ReorderBufferOutputStage::consumer_main, this, output_path, format)
+                  consumer_thread_(&FutureQueueOutputStage::consumer_main, this, output_path, format)
             {
             }
 
             /**
              * @brief 析构并安全关闭；Destroy and safely close.
              */
-            ~ReorderBufferOutputStage()
+            ~FutureQueueOutputStage()
             {
                 close_noexcept();
             }
@@ -423,23 +425,23 @@ namespace jacobi::svd::pipeline
             /**
              * @brief 禁止拷贝构造；Copy construction is disabled.
              */
-            ReorderBufferOutputStage(const ReorderBufferOutputStage &) = delete;
+            FutureQueueOutputStage(const FutureQueueOutputStage &) = delete;
 
             /**
              * @brief 禁止拷贝赋值；Copy assignment is disabled.
              * @return 当前对象引用；Reference to current object.
              */
-            ReorderBufferOutputStage &operator=(const ReorderBufferOutputStage &) = delete;
+            FutureQueueOutputStage &operator=(const FutureQueueOutputStage &) = delete;
 
             /**
              * @brief 提交已完成数据包；Submit one completed packet.
              * @param packet 已完成数据包；Completed output packet.
              */
-            void submit(OutputPacket packet)
+            void submit(std::future<OutputPacket> future_packet)
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 producer_cv_.wait(lock, [this] {
-                    return completed_queue_.size() < queue_capacity_ || closed_ || worker_error_ != nullptr;
+                    return future_queue_.size() < queue_capacity_ || closed_ || worker_error_ != nullptr;
                 });
                 rethrow_worker_error_locked();
 
@@ -448,7 +450,7 @@ namespace jacobi::svd::pipeline
                     throw std::runtime_error("Output stage is closed.");
                 }
 
-                completed_queue_.push(std::move(packet));
+                future_queue_.push(std::move(future_packet));
                 consumer_cv_.notify_one();
             }
 
@@ -469,7 +471,7 @@ namespace jacobi::svd::pipeline
 
                 if (written_count_ != expected_count_)
                 {
-                    throw std::runtime_error("Output reorder stage finished with missing packets.");
+                    throw std::runtime_error("Output stage finished with missing packets.");
                 }
             }
 
@@ -508,20 +510,20 @@ namespace jacobi::svd::pipeline
 
                     for (;;)
                     {
-                        OutputPacket packet;
-                        bool has_packet = false;
+                        std::future<OutputPacket> future_packet;
+                        bool has_future = false;
 
                         {
                             std::unique_lock<std::mutex> lock(mutex_);
                             consumer_cv_.wait(lock, [this] {
-                                return !completed_queue_.empty() || closed_ || abort_;
+                                return !future_queue_.empty() || closed_ || abort_;
                             });
 
-                            if (!completed_queue_.empty())
+                            if (!future_queue_.empty())
                             {
-                                packet = std::move(completed_queue_.front());
-                                completed_queue_.pop();
-                                has_packet = true;
+                                future_packet = std::move(future_queue_.front());
+                                future_queue_.pop();
+                                has_future = true;
                                 producer_cv_.notify_one();
                             }
                             else if (closed_ || abort_)
@@ -530,21 +532,16 @@ namespace jacobi::svd::pipeline
                             }
                         }
 
-                        if (!has_packet)
+                        if (!has_future)
                         {
                             continue;
                         }
 
-                        auto [iterator, inserted] = reorder_buffer_.emplace(packet.testcase_index, std::move(packet));
-                        if (!inserted)
-                        {
-                            throw std::runtime_error("Duplicate testcase index in reorder buffer.");
-                        }
-
-                        flush_ready_packets(writer);
+                        OutputPacket packet = future_packet.get();
+                        writer.write_packet(packet);
+                        ++written_count_;
                     }
 
-                    flush_ready_packets(writer);
                     writer.flush();
                 }
                 catch (...)
@@ -558,27 +555,6 @@ namespace jacobi::svd::pipeline
                     abort_ = true;
                     producer_cv_.notify_all();
                     consumer_cv_.notify_all();
-                }
-            }
-
-            /**
-             * @brief 尝试按序写出连续数据包；Flush contiguous packets in order.
-             * @param writer 结果写出器；Result writer.
-             */
-            void flush_ready_packets(ResultWriter &writer)
-            {
-                for (;;)
-                {
-                    const auto iterator = reorder_buffer_.find(next_expected_index_);
-                    if (iterator == reorder_buffer_.end())
-                    {
-                        break;
-                    }
-
-                    writer.write_packet(iterator->second);
-                    reorder_buffer_.erase(iterator);
-                    ++next_expected_index_;
-                    ++written_count_;
                 }
             }
 
@@ -629,19 +605,9 @@ namespace jacobi::svd::pipeline
             std::size_t queue_capacity_ = 1;
 
             /**
-             * @brief 完成数据包队列；Completed packet queue.
+             * @brief 输出 future 队列；Output future queue.
              */
-            std::queue<OutputPacket> completed_queue_;
-
-            /**
-             * @brief 重排序缓冲区；Reorder buffer.
-             */
-            std::unordered_map<std::size_t, OutputPacket> reorder_buffer_;
-
-            /**
-             * @brief 下一个期望索引；Next expected testcase index.
-             */
-            std::size_t next_expected_index_ = 0;
+            std::queue<std::future<OutputPacket>> future_queue_;
 
             /**
              * @brief 期望总包数；Expected packet count.
@@ -811,37 +777,11 @@ namespace jacobi::svd::pipeline
         }
 
         KernelStage kernel(runtime_kernel_config);
-        ReorderBufferOutputStage output(config_.output_path, output_format, config_.max_queued_results);
+        FutureQueueOutputStage output(config_.output_path, output_format, config_.max_queued_results);
         GlobalThreadPool &pool = global_thread_pool();
 
-        std::exception_ptr first_worker_error;
         std::atomic<std::size_t> total_sweeps{0};
-        std::deque<std::future<void>> inflight;
-        const std::size_t max_inflight = std::max<std::size_t>(config_.max_queued_results, 1);
         std::size_t submitted_count = 0;
-
-        auto observe_future = [&first_worker_error](std::future<void> &task_future) {
-            try
-            {
-                task_future.get();
-            }
-            catch (...)
-            {
-                if (first_worker_error == nullptr)
-                {
-                    first_worker_error = std::current_exception();
-                }
-            }
-        };
-
-        auto submit_future = [&](std::future<void> future_task) {
-            inflight.push_back(std::move(future_task));
-            if (inflight.size() >= max_inflight)
-            {
-                observe_future(inflight.front());
-                inflight.pop_front();
-            }
-        };
 
         try
         {
@@ -856,22 +796,18 @@ namespace jacobi::svd::pipeline
                     dispatch_task = io::MatDispatchTask{};
 
                     const std::size_t testcase_index = task_for_worker.sequence_index;
-                    submit_future(pool.submit([task = std::move(task_for_worker),
-                                               testcase_index,
-                                               &kernel,
-                                               &output,
-                                               &total_sweeps]() mutable {
+                    std::future<OutputPacket> packet_future = pool.submit([task = std::move(task_for_worker),
+                                                                           testcase_index,
+                                                                           &kernel,
+                                                                           &total_sweeps]() mutable -> OutputPacket {
                         io::Matrix testcase = io::decode_dispatch_task_matrix(task);
                         OutputPacket packet = kernel.execute(testcase, testcase_index);
                         total_sweeps.fetch_add(static_cast<std::size_t>(packet.sweeps), std::memory_order_relaxed);
-                        output.submit(std::move(packet));
-                    }));
+                        return packet;
+                    });
+                    output.submit(std::move(packet_future));
 
                     submitted_count += 1;
-                    if (first_worker_error != nullptr)
-                    {
-                        break;
-                    }
                 }
             }
             else
@@ -885,35 +821,19 @@ namespace jacobi::svd::pipeline
                     io::Matrix testcase_for_worker = std::move(testcase);
                     testcase = io::Matrix{};
 
-                    submit_future(pool.submit([testcase_data = std::move(testcase_for_worker),
-                                               testcase_index,
-                                               &kernel,
-                                               &output,
-                                               &total_sweeps]() mutable {
+                    std::future<OutputPacket> packet_future = pool.submit([testcase_data = std::move(testcase_for_worker),
+                                                                           testcase_index,
+                                                                           &kernel,
+                                                                           &total_sweeps]() mutable -> OutputPacket {
                         OutputPacket packet = kernel.execute(testcase_data, testcase_index);
                         total_sweeps.fetch_add(static_cast<std::size_t>(packet.sweeps), std::memory_order_relaxed);
-                        output.submit(std::move(packet));
-                    }));
+                        return packet;
+                    });
+                    output.submit(std::move(packet_future));
 
                     submitted_count += 1;
                     testcase_index += 1;
-                    if (first_worker_error != nullptr)
-                    {
-                        break;
-                    }
                 }
-            }
-
-            while (!inflight.empty())
-            {
-                observe_future(inflight.front());
-                inflight.pop_front();
-            }
-
-            if (first_worker_error != nullptr)
-            {
-                output.close_error(first_worker_error);
-                std::rethrow_exception(first_worker_error);
             }
 
             output.close_success(submitted_count);
