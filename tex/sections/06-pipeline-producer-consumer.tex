@@ -1,4 +1,4 @@
-\section{全局线程池、重排序缓冲区与 pipeline 聚合根}
+\section{全局线程池与重排序缓冲区实现 Pipeline 聚合根}
 
 前几章已经把数值内核（kernel）与 I/O 数据平面（data plane）拆开了；本章只讨论
 \texttt{pipeline.cpp}。它不新增任何奇异值分解（Singular Value Decomposition, SVD）公式，
@@ -13,9 +13,10 @@
 拼成一次端到端执行。换句话说，\texttt{JacobiSvdPipeline} 是应用层聚合根（aggregate root）：
 它拥有调度权、关闭协议与错误传播语义，但不偷走 I/O 与 CUDA 内核的领域职责。
 
-当前实现已经不再是“主线程串行计算，写线程异步落盘”的简单模型，
-而是演化为显式的生产者-消费者（producer-consumer）并发骨架。
-新的骨架是：
+不过，最新实现与上一版文档最大的不同在于：它已经不再维护一个显式的
+\texttt{unordered\_map}-式重排序缓冲区（reorder buffer）。
+当前代码把“乱序完成、顺序提交”这层语义折叠进了一个
+\textbf{按输入顺序排队的 \texttt{future} 队列}里。于是整体骨架更准确地写成
 \[
     \texttt{input}
     \longrightarrow
@@ -23,16 +24,18 @@
     \longrightarrow
     \texttt{global thread pool}
     \longrightarrow
-    \texttt{reorder buffer}
+    \texttt{FIFO future queue}
     \longrightarrow
     \texttt{single writer}.
 \]
-这一结构需要同时满足四类要求：较高吞吐、稳定有序的输出、可控的内存驻留，以及不丢失的跨线程错误传播。
-这一章就按这四类问题背后的结构来讲，而不再沿着“读到哪段代码就解释哪段代码”的顺序展开。
+如果借用处理器体系结构（computer architecture）的语言，这更像“有序提交
+（ordered commit）”而不是“显式按 index 回填的重排序表”。
+之所以仍保留本章的历史标题，是因为它表达的抽象问题没有变：输入顺序必须保真，工作线程可以乱序完成，
+而文件输出必须重新回到确定性的提交顺序。本章就围绕这层新语义，重写 pipeline 的理论动机、控制流与工程边界。
 
 \subsection{为什么这样设计 pipeline：理论动机、顺序契约与复杂度边界}
 
-先看最朴素的串行方案。若第 $i$ 个 testcase 的主要耗时分解为
+先看最朴素的串行方案。若第 $i$ 个 testcase 的主要主机侧耗时分解为
 \[
     R_i=\text{读取/派发},\qquad
     D_i=\text{解码},\qquad
@@ -45,74 +48,90 @@
     =
     \sum_{i=0}^{N-1}(R_i+D_i+C_i+W_i).
 \]
-这种写法实现简单，但它把所有阶段硬串成一条长临界路径（critical path）：磁盘抖动、文本解析、GPU 调度和输出写回彼此阻塞。
+这种写法最容易理解，但它把文件读取、页锁定缓冲准备、GPU 计算与结果落盘全部压在一条长临界路径
+（critical path）上。只要某一张矩阵稍慢，后面所有 testcase 都会被迫等待。
 
-本项目更关心的是跨 testcase 的吞吐（throughput），而不是试图通过主机侧多线程人为放大单个矩阵 CUDA kernel 的速度。
-因此我们把主线程保留为顺序派发者，把可并行的那部分外包给全局线程池（global thread pool），并让写出阶段异步执行。
-于是稳定阶段的节拍更接近
+当前 pipeline 的思路不是在主机侧“暴力多线程化一切”，而是只把真正可并行的
+\emph{跨 testcase 工作}交给全局线程池（global thread pool），并保留一个单线程 writer 负责稳定输出。
+于是稳定阶段的端到端节拍更接近
 \[
     T_{\mathrm{steady}}
     \approx
-    \max(T_{\mathrm{dispatch}},T_{\mathrm{workers}},T_{\mathrm{writer}}),
+    \max(T_{\mathrm{dispatch}},T_{\mathrm{workers}},T_{\mathrm{commit}}),
 \]
-而不是简单求和。需要强调的是，host 侧线程并发并不自动等价于 device 侧 kernel 的真实并行；
-若多个任务共享同一 GPU、同一默认流（default stream）或相同运行时资源，它们仍然可能在设备侧排队。
-所以这套 pipeline 优化的是端到端资源组织，而不是单个 SVD 内核的渐近复杂度。
+其中最后一项的名字特意写成 \texttt{commit} 而不是 \texttt{write}，
+因为写线程当前做的不只是“把字节写出去”，它还承担了一个更强的顺序承诺：
+\textbf{只有排在最前面的 future 可以提交，后面的结果即使先算完，也不能越过它。}
 
-第二个约束是顺序契约（ordering contract）。输入流天然有序：
+这就引出了顺序契约（ordering contract）。输入流天然有序：
 \[
     X_0,X_1,\ldots,X_{N-1}.
 \]
-但一旦 testcase 被并发执行，完成顺序就会变成某个排列
+工作线程一旦并发执行，真实完成顺序就会变成某个排列
 \[
     P_{\pi(0)},P_{\pi(1)},\ldots,P_{\pi(N-1)}.
 \]
-如果直接按完成顺序写文件，那么同一输入在不同运行里可能生成不同顺序的输出；这对实验复现、下游比对和故障定位都很糟糕。
-因此系统必须显式恢复
+旧版实现的思路是“先接受乱序完成，再按 \texttt{testcase\_index} 重排”；新版实现则走了另一条路：
+\textbf{主线程按照输入顺序，把 \texttt{future<OutputPacket>} 依次送进输出阶段；写线程也按这一顺序依次取 future，
+    并在提交点调用 \texttt{future.get()}。}
+因此真正被提交到文件中的顺序不是“谁先算完”，而是
 \[
-    (U_0,\Sigma_0,V_0),
-    (U_1,\Sigma_1,V_1),
-    \ldots
+    \texttt{commit}(0)
+    \prec
+    \texttt{commit}(1)
+    \prec
+    \cdots
+    \prec
+    \texttt{commit}(N-1).
 \]
-这样的单调顺序，而不能把“顺序正确”寄托在线程调度运气上。
+这是一种更收缩的状态机：系统不再需要显式维护“谁已经完成但不能提交”的散列表，
+而是用队列顺序天然表达“谁有资格先提交”。
 
-第三个约束是内存上界。单个输出数据包（output packet）近似包含
+当然，这种设计也不是免费午餐。它把原本的“显式重排复杂度”换成了“队首阻塞
+（head-of-line blocking）”。若 future$_0$ 迟迟不完成，而 future$_1$、future$_2$ 已经 ready，
+写线程仍然必须在
 \[
-    m_in_i+n_i+n_i^2
+    \texttt{future}_0.\texttt{get()}
 \]
-个标量，其中 $V_i\in\mathbb{R}^{n_i\times n_i}$ 往往占主导。若没有背压（backpressure），
-主线程可以无限提交任务，工作线程可以无限完成结果，最后系统只是在用内存掩盖慢写出。
-因此我们把队列窗口参数 \texttt{--queue-capacity} 解释为
-\[
-    W=\max(\texttt{max\_queued\_results},1),
-\]
-并让它同时约束 in-flight future 数量与完成结果的堆积规模。若
-\[
-    E_{\max}=\max_i(m_in_i+n_i+n_i^2),
-\]
-则长期结果驻留的结构上界可粗略写成
-\[
-    M_{\mathrm{pending}}=O(W\cdot E_{\max}).
-\]
-这不是精确的 profiling 结果，而是一个重要的设计结论：资源上界由窗口显式控制，而不是隐含地依赖输入文件长度。
+处等待。这意味着当前实现优化的是\textbf{状态简洁性与顺序确定性}，而不是“谁先完成谁先提交”的最大化吞吐。
+对本项目来说，这是一个很合理的工程取舍：实验结果的稳定顺序比额外引入一套乱序完成表更重要。
 
-第四个约束是错误诚实性（error honesty）。对于并发系统而言，更危险的失败模式往往不是显式崩溃，
-而是部分失败被错误地报告为成功。因此，本章后续的实现细节都围绕同一个目标展开：当输入有序、计算并发、完成乱序而输出又必须有序时，
-系统如何在维持吞吐的同时保持确定性（determinism）与失败可审计性（auditability）。
+第三个约束是内存与 in-flight 上界。CLI 把 \texttt{--queue-capacity} 解释为
+\[
+    W=\max(\texttt{max\_queued\_results},1).
+\]
+但必须精确说明：在新模型里，$W$ 直接限制的是
+\texttt{FutureQueueOutputStage} 内部 \texttt{future\_queue\_} 的容量，而不是“所有尚未写出的对象总数”的严格数学上界。
+这是因为 writer 线程会先把一个 future 从队列里弹出，再在队列外执行 \texttt{get()}；
+主线程也可能在 \texttt{submit()} 被阻塞前，刚刚多提交了一个对应 worker 任务。于是更准确的说法是：
+\[
+    M_{\mathrm{pending}}
+    =
+    O((W+\delta)\cdot E_{\max}),
+\]
+其中 $E_{\max}$ 表示单个 testcase 结果包的最大规模，
+$\delta$ 是由“writer 手中正在等待的一个 future”和“生产者临界区外的一次过渡提交”引入的小常数。
+这不是 profiling 精确值，而是一条更诚实的系统结论：新实现仍然是\emph{有界}的，但边界来自
+``有界 future admission''，而不是旧版那种显式完成包缓存。
+
+最后一个约束是错误诚实性（error honesty）。并发系统最怕的不是抛异常本身，
+而是某个线程已经知道结果不可信，而主线程还在继续把流程包装成“成功执行完毕”。
+本章后面的所有细节，无论是关闭协议、原子计数、还是 writer 线程统一吸收 future 异常，
+本质上都服务于同一个目标：\textbf{一旦任一阶段认定结果不再可信，\texttt{run()} 最终就不能报告成功。}
 
 \subsection{全局线程池实现：把并发入口集中起来，而不是到处偷开线程}
 
-\texttt{GlobalThreadPool} 的实现刻意保持最小语义集合。它是一个进程内惰性初始化
-（lazy initialization）的全局对象：
+\texttt{GlobalThreadPool} 依然刻意保持极小语义集合。它是一个惰性初始化
+（lazy initialization）的进程内全局对象：
 \[
     \texttt{global\_thread\_pool()}
     \Rightarrow
     \texttt{static GlobalThreadPool pool(default\_thread\_pool\_size())}.
 \]
-默认线程数来自 \texttt{std::thread::hardware\_concurrency()}，若系统无法报告，则回退到 $4$。
+默认线程数来自 \texttt{std::thread::hardware\_concurrency()}，若运行环境不给出可信值，则回退到 $4$。
 构造时一次性创建 worker；析构时设置 \texttt{stopping\_}，唤醒所有线程，再逐个 \texttt{join()}。
 
-它的工作线程主循环几乎可以写成三行：
+它的工作线程主循环几乎可以压缩成三步：
 \[
     \text{wait until } \texttt{stopping\_}\lor\neg Q.empty()
     \longrightarrow
@@ -120,272 +139,377 @@
     \longrightarrow
     \text{execute outside lock}.
 \]
-这段代码的关键特征在于没有引入额外语义。线程池只负责任务排队、唤醒和执行；
-它不感知 testcase 编号、矩阵维度和输出顺序，也不持有 Jacobi SVD 的应用语义。
-与业务相关的协议均保留在 pipeline 外层。
+这里最重要的好品味（good taste）不是“用了线程池”这件事本身，
+而是线程池\textbf{不理解业务顺序语义}。它只知道自己维护
+\texttt{std::queue<std::function<void()>>}，
+并通过条件变量（condition variable）协调 worker 睡眠与唤醒。
+至于 testcase 是第几号、输出该不该有序、某个 future 何时能提交，都不属于线程池的职责。
 
-任务提交通过 \texttt{std::packaged\_task<void()>} 包装，接口是
+和上一版文档不同，\texttt{submit()} 现在返回的不是
+\texttt{std::future<void>}，而是模板化的
 \[
-    \texttt{submit}(f)\longrightarrow \texttt{std::future<void>}.
+    \texttt{std::future<ResultType>}.
 \]
-这样做有两个直接收益。第一，工作线程异常会自动被 future 捕获，主线程可以在合适的位置统一观察；
-第二，线程池不需要感知任务结果的数据结构，因为真正的大对象结果并不通过 future 返回，
-而是由任务本身提交给输出阶段。future 仅承担任务完成状态的传播职责。
+具体做法是把调用者传入的可调用对象（callable）包装成
+\texttt{std::packaged\_task<ResultType()>}，再把该 task 的执行闭包压入线程池队列。
+这有两个直接收益。
 
-为什么线程池设计为全局对象，而不是每次 \texttt{run()} 都临时构造一组线程？原因主要有三点：
+\begin{itemize}
+    \item 线程池不需要知道结果类型是什么；它只执行闭包，不解释 \texttt{OutputPacket}。
+    \item worker 里抛出的异常会自动落入 future 的共享状态（shared state），后续由 writer 线程在
+          \texttt{future.get()} 处统一观察。
+\end{itemize}
+
+这点很关键，因为当前实现已经把“错误汇聚点”从主线程转移到了输出阶段。
+主线程提交给线程池的闭包通常长成下面这种形式：
+\[
+    \texttt{task}
+    \longrightarrow
+    \texttt{decode}
+    \longrightarrow
+    \texttt{kernel.execute}
+    \longrightarrow
+    \texttt{return OutputPacket}.
+\]
+线程池只负责把这个函数跑完；它既不会主动 \texttt{get()} 结果，也不会替 pipeline 写文件。
+
+为什么线程池继续保留为全局对象，而不是每次 \texttt{run()} 都新建一批线程？
+核心原因仍然有三点：
 
 \begin{itemize}
     \item 线程创建与销毁不是零成本；
-    \item 并发总量必须有统一入口，否则每一层都觉得自己“只多开一点点线程”，最后总量失控；
-    \item pipeline 是应用层协议，不该在每次运行里重复建造同一种基础设施。
+    \item 并发总量需要有集中入口，否则每层各自“只多开一点点线程”很快就会失控；
+    \item pipeline 是应用层协议，不应重复建造同一种宿主基础设施。
 \end{itemize}
 
-当然，全局线程池也有明确边界。当前池内任务队列本身没有容量上界，真正的背压发生在 pipeline 外层的 future 窗口。
-这意味着“只要所有任务都通过 \texttt{JacobiSvdPipeline::run()} 提交”，资源控制就是可信的；
-但若未来其他模块也复用这同一个全局池，就需要重新审视是否要为线程池内部补上 bounded queue、优先级或独立执行器
-（executor）语义。
+当然，也要诚实指出它的边界。当前线程池内部任务队列本身并\textbf{没有}容量上界，
+真正的背压主要来自外层的 \texttt{FutureQueueOutputStage::submit()}。
+这意味着：只要所有任务都遵循“提交一个 worker future 后立刻尝试送入输出阶段”的当前控制流，
+系统的 in-flight 数量就是有限的；但如果未来有别的模块直接复用这同一个全局线程池并大量投递任务，
+那就需要重新讨论 bounded queue、独立执行器（executor）或更细的资源隔离。
 
 \subsection{流程与重排序缓冲区：主线程派发、工作线程执行、写线程恢复顺序}
 
-从控制流看，\texttt{run()} 的主骨架其实可以压缩成下面这条链：
+这一小节的标题保留了“重排序缓冲区”这个历史说法，但必须先说清楚：
+\textbf{当前实现已经没有单独的 \texttt{reorder\_buffer\_} 容器。}
+新的顺序恢复机制，实际上是“按输入顺序排队的 future 提交队列 + 单 writer 顺序 \texttt{get()}”。
+从抽象效果看，它仍然实现了 ordered commit；从数据结构看，它比旧版更收缩。
+
+从控制流看，\texttt{run()} 的主骨架现在更接近下面这条链：
 \[
     \begin{aligned}
         \text{normalize config}
          & \longrightarrow
-        \text{dispatch testcase } i
+        \text{read testcase } i
         \longrightarrow
-        \text{submit worker future} \\
+        \text{submit worker future}    \\
          & \longrightarrow
-        \text{worker computes } P_i
+        \text{enqueue future in FIFO output stage}
         \longrightarrow
-        \text{output.submit}(P_i)
+        \text{writer pops next future} \\
+         & \longrightarrow
+        \texttt{future.get()}
         \longrightarrow
-        \text{writer flush}.
+        \text{write } U_i,\Sigma_i,V_i.
     \end{aligned}
 \]
-这里真正关键的不是阶段数量，而是每个阶段只持有其职责所必需的状态。
+这里最值得注意的变化是：\textbf{输出阶段接收的不是已经完成的 \texttt{OutputPacket}，而是
+    未来会产生该 packet 的 \texttt{future}}。因此“消费者”其实消费的是\emph{提交资格}，而不是现成结果。
 
-\paragraph{第一步：主线程顺序派发。}
-主线程保留单游标（single cursor）读取权。这一点十分重要，因为文件输入天然有序、最容易审计，也最不适合在此处引入额外并发复杂度。
-对于 \texttt{*.mat} 输入，\texttt{MatDispatchReader} 读取的是
+\paragraph{第一步：主线程保留单游标读取权。}
+对于 \texttt{*.mat} 路径，\texttt{io::MatDispatchReader} 顺序读出
+\texttt{MatDispatchTask}。该对象里已经带有
 \[
     (\texttt{sequence\_index},\texttt{rows},\texttt{columns},\texttt{buffer})
 \]
-这样的 \texttt{MatDispatchTask}；其中 \texttt{buffer} 是由 \texttt{cudaMallocHost} 管理的页锁定主机内存
-（page-locked host memory, pinned host memory）。主线程只负责把原始网络字节序（network byte order）的 payload
-装进这块 pinned buffer，再把任务移动给 worker。对于 \texttt{*.txt} 输入，主线程仍然先解析成
-\texttt{io::Matrix}，再把完整矩阵交给线程池，因为文本语法解析天然更适合留在顺序边界上。
+这组信息，其中 \texttt{buffer} 是由 \texttt{cudaMallocHost} 管理的页锁定主机内存
+（page-locked host memory, pinned host memory）。
+主线程每次把读出的 dispatch task 移动到局部对象 \texttt{task\_for\_worker}，
+随后立刻把原变量重置为空任务，以保持所有权边界清晰。
 
-\paragraph{第二步：future 窗口充当外层节流阀。}
-每次调用 \texttt{pool.submit(...)} 之后，返回的 future 都会进入
-\texttt{std::deque<std::future<void>> inflight}。一旦
-\[
-    |\texttt{inflight}| \ge W,
-\]
-主线程就立刻对队首 future 做 \texttt{get()}。这一步非常关键：它既避免了无限提交任务，也保证异常不会延迟到输入全部读取完毕后才暴露。
-于是 \texttt{--queue-capacity} 不再只是“输出队列容量”，而是整个 pipeline 的 in-flight / reorder window。
+对于 \texttt{*.txt} 路径，则由 \texttt{TextTestcaseSource} 在主线程中直接解析出
+\texttt{io::Matrix}，再把该矩阵移动给 worker。也就是说，当前实现把
+\texttt{*.mat} 与 \texttt{*.txt} 的差异放在“任务准备形态”这一层，而不是强行让二者共享一套低层数据结构。
 
-\paragraph{第三步：工作线程只做单 testcase 的准备、计算与提交。}
-无论输入来自 \texttt{MatDispatchTask} 还是 \texttt{io::Matrix}，worker 端最终都归约为同一工作流：
+\paragraph{第二步：worker 闭包只负责单 testcase 的局部工作。}
+两条输入路径最终都归约到同一件事：提交一个返回 \texttt{OutputPacket} 的闭包。
+在 \texttt{*.mat} 路径里，闭包会先执行
 \[
-    \text{prepare Matrix}
-    \longrightarrow
-    \texttt{KernelStage::execute}
-    \longrightarrow
-    \texttt{output.submit}(P_i).
+    \texttt{io::decode\_dispatch\_task\_matrix(task)},
 \]
-在 \texttt{*.mat} 路径里，worker 先执行 \texttt{decode\_dispatch\_task\_matrix}；
-随后 \texttt{KernelStage::execute} 验证
+把网络字节序载荷解码为 \texttt{io::Matrix}；在 \texttt{*.txt} 路径里，这一步已经提前在主线程完成。
+随后两条路径都调用
+\[
+    \texttt{kernel.execute(testcase, testcase\_index)},
+\]
+其中 \texttt{KernelStage::execute()} 先检查
 \[
     rows>0,\qquad columns>0,\qquad |\texttt{values}|=rows\cdot columns,
 \]
-再调用 \texttt{one\_sided\_jacobi\_svd}。结果会被重组为
+再调用 \texttt{one\_sided\_jacobi\_svd()}，
+最后把结果组织成
 \[
-    P_i=(i,s_i,U_i,\Sigma_i,V_i),
+    P_i=(i,s_i,U_i,\Sigma_i,V_i).
 \]
-其中 $\Sigma_i$ 仍编码成 $1\times n_i$ 的矩阵，而不是裸数组。
-这样一来，输出阶段只需要处理一种对象 \texttt{io::Matrix}，从而避免额外的特例分支。
+这里的 \texttt{testcase\_index} 仍然被保存在 \texttt{OutputPacket} 里，
+但当前 writer \textbf{并不再依赖该 index 做重排}；它更像一种审计字段（audit field）与调试字段。
 
-\paragraph{第四步：完成队列吸收并发完成，重排序缓冲区恢复文件顺序。}
-\texttt{ReorderBufferOutputStage} 的核心不在于额外引入一个线程，
-而在于把输出状态划分为两层结构：
+\paragraph{第三步：future 在生成后立刻进入输出阶段，而不是先在主线程积压。}
+这是新版并发模型最本质的变化之一。当前 \texttt{run()} 并没有维护额外的
+\texttt{inflight deque}。相反，主线程在每次
 \[
-    Q_c=\texttt{completed\_queue\_},\qquad
-    B=\texttt{reorder\_buffer\_}.
+    \texttt{pool.submit(...)} \longrightarrow \texttt{future<OutputPacket>}
 \]
-\texttt{completed\_queue\_} 是工作线程提交完成 packet 的有界 FIFO；\texttt{reorder\_buffer\_} 是写线程私有的
-\texttt{unordered\_map<std::size\_t, OutputPacket>}，按 testcase index 暂存乱序结果。工作线程只负责
+之后，会立即执行
 \[
-    P_i\longrightarrow Q_c,
+    \texttt{output.submit(std::move(packet\_future))}.
 \]
-写线程则执行
-\[
-    Q_c\longrightarrow B
-    \longrightarrow
-    \text{flush all contiguous } B[\texttt{next\_expected\_index\_}].
-\]
-只要某个 packet 的 index 正好等于当前期待值，写线程就按固定顺序写出
-\[
-    U_i,\quad \Sigma_i,\quad V_i,
-\]
-然后递增 \texttt{next\_expected\_index\_}。于是“完成顺序”和“文件顺序”被显式解耦：前者受调度影响，后者由 index 协议定义。
+因此，主线程不再手工轮询一串 future 来决定“哪一个先 ready”，而是把这个顺序资格整体转交给输出阶段。
+这让主线程的责任进一步收缩成“顺序读取、顺序投递”。
 
-\paragraph{第五步：背压沿整条链回传。}
-\texttt{submit(packet)} 只有在
+\paragraph{第四步：\texttt{FutureQueueOutputStage} 用 FIFO future 队列表达 ordered commit。}
+输出阶段内部最核心的状态不是“已完成 packet 映射表”，而是
 \[
-    |Q_c|<\texttt{queue\_capacity\_}
+    Q_f=\texttt{future\_queue\_}.
+\]
+\texttt{submit()} 的协议是：只有当
+\[
+    |Q_f|<\texttt{queue\_capacity\_}
     \quad\lor\quad
     \texttt{closed\_}
     \quad\lor\quad
-    \texttt{worker\_error\_}\ne\varnothing
+    \texttt{worker\_error\_}\neq\varnothing
 \]
-时才会继续。于是当写线程跟不上时，会形成如下背压链：
+时，生产者线程才能继续。否则主线程会在条件变量上等待。
+一旦 admission 成功，该 future 就按输入顺序被压入 FIFO 队列。
+
+writer 线程的主循环则执行另一条极简状态机：
 \[
-    \text{slow writer}
-    \rightarrow
-    Q_c \text{ full}
-    \rightarrow
-    \text{worker blocked in submit}
-    \rightarrow
-    \text{future not ready}
-    \rightarrow
-    \text{main dispatch blocked}.
+    \text{pop front future}
+    \longrightarrow
+    \texttt{future.get()}
+    \longrightarrow
+    \texttt{write\_packet(packet)}
+    \longrightarrow
+    \texttt{written\_count\_++}.
 \]
-这正是期望的行为：慢输出应当通过背压减慢整个系统，而不是以隐式内存膨胀的形式被掩盖。
-配合 future 窗口，
-重排序缓冲区的长期驻留也被限制在一个有限窗口内，而不会随着输入总长度 $N$ 线性增长。
+\texttt{ResultWriter::write\_packet()} 又进一步固定了每个 testcase 的落盘顺序：
+\[
+    U_i \longrightarrow \Sigma_i \longrightarrow V_i.
+\]
+所以，当前的“顺序恢复”不是通过比较 \texttt{packet.testcase\_index} 完成的，
+而是通过\textbf{谁先被压入 future 队列，谁就先拥有提交资格}来完成的。
+
+\paragraph{第五步：队首阻塞是显式接受的系统属性。}
+由于 writer 会在拿到队首 future 后直接调用 \texttt{get()}，所以它天然具备以下性质：
+\[
+    \text{if }\texttt{future}_i\text{ not ready, then commit}_{i+1}\text{ cannot happen.}
+\]
+换句话说，后面的 testcase 即使已经算完，也不能越过更早的 testcase 提交。
+这与旧版“先接纳所有已完成 packet，再按 index 刷出连续前缀”的思路不同。
+旧版偏向乱序完成后显式回填；新版偏向\emph{有序提交窗口}。
+
+这套机制的好处是状态少、推理简单、错误路径更短。坏处也同样真实：一旦某个早期 testcase 特别慢，
+writer 就会在它前面卡住，后续 ready 的结果只能在 future 共享状态中等待。
+所以这里不存在所谓“纯优势升级”；它是一个非常典型的 systems trade-off：
+\textbf{用更小的协议状态，换取可接受的 head-of-line blocking。}
+
+\paragraph{第六步：背压沿着生产者-消费者链条自动回传。}
+一旦 writer 比较慢，或者某个队首 future 长时间不 ready，
+\texttt{future\_queue\_} 就会逐步占满。此时主线程会在 \texttt{output.submit()} 处阻塞，
+从而形成如下背压链：
+\[
+    \text{slow commit or slow writer}
+    \rightarrow
+    Q_f \text{ full}
+    \rightarrow
+    \text{producer blocked in submit}
+    \rightarrow
+    \text{dispatch slows down}.
+\]
+这条回路很重要，因为它意味着慢写出不会被伪装成“只是多用了一点内存”。
+当前实现明确选择让吞吐退化显式发生，而不是让资源占用隐式膨胀。
 
 \subsection{工程健壮性细节：配置归一化、关闭协议、异常传播与不变量}
 
-在并发骨架建立之后，真正决定系统是否具备工程可用性的，是这些看似次要、但实际决定鲁棒性的细节。
+并发骨架搭好之后，真正决定工程可用性的，是这些“看起来不起眼、但实际上最容易埋雷”的细节。
+当前 \texttt{pipeline.cpp} 的健壮性，主要建立在四组机制上。
 
-\paragraph{其一，运行前先归一化配置，而不是把歧义带进并发区。}
-\texttt{run()} 的开头先检查输入、输出路径非空，再通过 \texttt{resolve\_file\_format} 把
-\texttt{auto\_detect} 落成具体格式，只接受 \texttt{.mat} 和 \texttt{.txt}。若用户启用
-\texttt{layout\_transpose\_auto\_tune} 且布局模式仍是 \texttt{auto\_select}，pipeline 会先做一次
-阈值自动调优（auto-tuning），把推荐阈值写回本次运行的 kernel 配置，然后关闭本次执行中的调优标志。
-这一步必须发生在并发启动之前；否则多个 worker 各自执行 benchmark，将导致同一运行内的语义混乱和资源争用。
+\paragraph{其一，先归一化配置，再启动并发。}
+\texttt{run()} 一开始就检查输入/输出路径是否为空，再通过
+\texttt{resolve\_file\_format()} 把 \texttt{auto\_detect} 解析成 \texttt{mat} 或 \texttt{txt}。
+若用户启用了布局转置自动调优（layout-transpose auto-tuning），并且模式仍是
+\texttt{LayoutTransposeMode::auto\_select}，pipeline 会先调用
+\texttt{auto\_tune\_layout\_transpose\_threshold()}，
+把推荐阈值写回本次运行使用的 \texttt{runtime\_kernel\_config}，
+然后把 \texttt{layout\_transpose\_auto\_tune} 关掉。
 
-\paragraph{其二，关闭协议必须区分成功路径与失败路径。}
-成功路径上，主线程读完整个输入、观察完所有 future 后调用
+这一步必须发生在任何 worker 启动之前。否则多个线程若各自拿着“尚未定型”的配置去 benchmark，
+那同一次运行内部就会出现语义竞争（semantic race）：大家计算的并不是同一个程序。
+
+\paragraph{其二，成功关闭与失败关闭是两条不同协议。}
+成功路径上，主线程读完整个输入流后调用
 \[
     \texttt{output.close\_success(submitted\_count)}.
 \]
-写线程排空完成队列与重排序缓冲区后退出；随后系统检查
+这会设置
+\[
+    \texttt{expected\_count\_}=submitted\_count,\qquad
+    \texttt{closed\_}=true,
+\]
+唤醒等待中的线程，随后 \texttt{join()} writer 线程。
+writer 结束后，系统还会额外检查
 \[
     \texttt{written\_count\_}=\texttt{expected\_count\_}.
 \]
-若不相等，则说明存在缺失 packet，例如某个 testcase 永远没有抵达，使重排序缓冲区无法越过空洞。
-此时应直接抛出错误，而不是将部分写出的文件误判为成功。失败路径上，任一 worker 异常或主线程读入失败都会触发
-\[
-    \texttt{output.close\_error(exception)}.
-\]
-这会设置 \texttt{worker\_error\_}、\texttt{closed\_} 与 \texttt{abort\_}，唤醒所有等待者并快速收尾。
-当前实现选择的是 fail-fast 语义，而不是“跳过异常 testcase 后继续写出后续结果”。
+若不相等，就直接抛错，而不是把缺包输出误判为成功。
 
-\paragraph{其三，异常传播有两条通道，但最终只允许一个结果：\texttt{run()} 不能错误报告成功。}
-工作任务内部的解码失败、矩阵验证失败、CUDA runtime 错误、\texttt{output.submit} 错误，
-都会进入对应 future，由主线程在 \texttt{future.get()} 时接住并保存为第一个 worker 错误。
-写线程内部的目录创建失败、writer 构造失败、重复 index、写文件失败等异常，则保存到
-\texttt{worker\_error\_}，再由后续的 \texttt{submit()} 或关闭路径重抛。于是错误传播图可以写成：
+失败路径上，任意主线程异常都会进入 \texttt{run()} 的外层 \texttt{catch}，
+随后调用
+\[
+    \texttt{output.close\_error(std::current\_exception())}.
+\]
+这会把首个错误保存到 \texttt{worker\_error\_}，同时设置
+\[
+    \texttt{closed\_}=true,\qquad \texttt{abort\_}=true,
+\]
+再唤醒所有等待者并尝试回收 writer 线程。
+也就是说，\textbf{关闭协议不是“一个 bool 完事”，而是明确区分 success close 与 error close。}
+
+\paragraph{其三，异常传播的汇聚点已经转移到输出阶段。}
+这一点与旧文档最不一样。当前 worker 任务抛出的异常，并不是由主线程直接 \texttt{future.get()} 观察到的，
+而是由 writer 线程在
+\[
+    \texttt{future\_packet.get()}
+\]
+处统一观察。无论异常来自 dispatch task 解码失败、矩阵布局校验失败、SVD kernel 抛错，
+还是 worker 闭包内部的任何其他异常，它们都会先进入 future 共享状态，
+然后在 writer 线程被重新抛出。随后 \texttt{consumer\_main()} 的总 \texttt{catch(...)} 会把该异常保存到
+\texttt{worker\_error\_} 中，并设置关闭/中止标志。
+
+writer 自己的 I/O 异常同样走这条路径。例如目录创建失败、输出流构造失败、\texttt{write\_packet()} 失败、
+\texttt{flush()} 失败，最后也都会变成
+\[
+    \texttt{worker\_error\_} \neq \varnothing.
+\]
+之后，主线程在后续 \texttt{submit()}、\texttt{close\_success()} 或 \texttt{close\_error()} 中都会被重抛。
+于是异常传播图更接近：
 \[
     \begin{aligned}
         \text{worker failure}
          & \rightarrow
-        \texttt{future}
+        \texttt{future shared state}
         \rightarrow
-        \texttt{run fails}, \\
-        \text{writer failure}
+        \texttt{writer thread get()} \\
          & \rightarrow
         \texttt{worker\_error\_}
         \rightarrow
-        \texttt{submit/close rethrows}
+        \texttt{submit/close rethrow}
         \rightarrow
-        \texttt{run fails}.
+        \texttt{run fails},
     \end{aligned}
 \]
-这两条通道共同保证：一旦任意线程认为结果不再可信，主线程最终就不能报告成功。
+\[
+    \text{writer failure}
+    \rightarrow
+    \texttt{worker\_error\_}
+    \rightarrow
+    \texttt{run fails}.
+\]
+这比“主线程自己轮询每个 future”更集中，也更符合当前有序提交模型。
 
-\paragraph{其四，资源释放依赖 RAII（Resource Acquisition Is Initialization），但错误报告依赖显式协议。}
-线程池析构负责停止并 \texttt{join()} worker；输出阶段析构调用 \texttt{close\_noexcept()} 作为兜底，
-避免 C++ 在栈展开（stack unwinding）期间再次抛异常。也就是说，析构函数负责“别泄漏资源”，
-而真正负责“把错误诚实地告诉调用者”的，仍然是显式的 \texttt{close\_success()} 与 \texttt{close\_error()}。
-这对应一条经典但可靠的工程原则：析构函数负责资源回收，而核心语义应通过显式协议表达。
-
-\paragraph{其五，不变量（invariants）比技巧更重要。}
-只要没有异常，本章设计依赖的核心不变量其实很少：
+\paragraph{其四，RAII 保证资源回收，显式协议保证语义诚实。}
+\texttt{GlobalThreadPool} 的析构负责停止并 \texttt{join()} 工作线程；
+\texttt{FutureQueueOutputStage} 的析构则调用 \texttt{close\_noexcept()} 作为兜底，
+即使调用者忘记显式关闭，也尽量避免资源泄漏或悬挂线程。
+但这里必须区分两种责任：
 
 \begin{itemize}
-    \item 每个 testcase 都获得唯一且单调递增的 \texttt{testcase\_index}；
-    \item 每个成功 worker 恰好产生一个 \texttt{OutputPacket}；
-    \item packet 的 index 在输出阶段不会被修改；
-    \item 完成队列只影响抵达顺序，不定义文件顺序；
-    \item 只有当 \texttt{next\_expected\_index\_} 命中时，写线程才会真正落盘；
-    \item 每个 testcase 固定写出三张矩阵：$U/\Sigma/V$；
-    \item 任意线程异常最终都能沿 future 或 \texttt{worker\_error\_} 回到主线程。
+    \item RAII（Resource Acquisition Is Initialization）负责“不要泄漏资源”。
+    \item \texttt{close\_success()} / \texttt{close\_error()} 负责“不要伪造成功语义”。
 \end{itemize}
 
-并发系统最容易失控的情形，是状态过多、例外过多且协议在不同层之间不断漂移。
-当前实现之所以仍然可分析，正是因为它把关键状态压缩成了：
-序号、future 窗口、完成队列、重排序缓冲区、下一个期望 index 和异常指针。
-只有在状态空间足够受限时，正确性才可能被系统性推理。
+也正因为如此，析构函数里的兜底关闭选择了 \texttt{noexcept} 吃掉异常；
+真正应该向上报告的错误，必须出现在显式关闭路径中，而不是留给栈展开
+（stack unwinding）去碰运气。
+
+\paragraph{其五，不变量比技巧更重要。}
+当前实现真正依赖的不变量（invariants）其实并不多，但每一条都很硬：
+
+\begin{itemize}
+    \item 主线程按输入顺序生成并提交 future；
+    \item 每个成功 worker 恰好返回一个 \texttt{OutputPacket}；
+    \item writer 只按 FIFO 顺序消费 future，不做额外排序；
+    \item 每个 testcase 固定写出三张矩阵：$U/\Sigma/V$；
+    \item \texttt{total\_sweeps} 只用于聚合统计，因此使用 \texttt{memory\_order\_relaxed} 即可；
+    \item 任意线程感知到的不可信状态，最终都必须让 \texttt{run()} 失败。
+\end{itemize}
+
+并发代码最危险的地方，往往不是锁多不多，而是状态与例外太多。当前新版实现能保持可分析性，
+正是因为它把关键状态压缩成了：一个全局线程池、一个有界 future 队列、一个 writer 线程、
+一组关闭标志和一个异常指针。状态空间越小，正确性才越容易被真正推理，而不是靠祈祷。
 
 \subsection{当前实现的边界与可演化方向}
 
-在上述设计下，当前实现已经为顺序输入、并发执行与有序输出建立了较稳定的协议边界；
-但它仍然保留了若干明确的系统边界。这些边界不应被简单理解为缺陷，
-而应被视为后续演化时必须显式处理的设计决策点。
+在新的 future-queue 并发模型下，\texttt{pipeline.cpp} 的结构已经明显更整洁；
+但边界也同样更加清晰了。这些边界不是“将来一定要修”的 bug 列表，
+更像是后续演化时必须显式作答的设计问题。
 
-\paragraph{第一，线程池大小尚未成为 pipeline 配置的一部分。}
-当前全局线程池的 worker 数由硬件并发数决定，而不是由 CLI 或 \texttt{PipelineConfig} 显式控制。
-这种设计降低了配置表面积，但也意味着用户当前只能控制 in-flight 窗口，
-而不能直接限制主机侧工作线程数。若未来 profiling 表明线程数本身成为关键变量，
-则可以考虑将其提升为进程级配置；不过这会进一步牵涉全局对象初始化与生命周期语义。
+\paragraph{第一，\texttt{queue\_capacity} 限制的是 output-stage admission，而不是线程池内部队列。}
+当前主线程的确会在每次生成 future 后立刻尝试 \texttt{output.submit()}，
+因此系统不会无限制地向前推进；但线程池内部的 \texttt{queue\_} 仍然是无界的。
+换句话说，当前资源控制依赖的是“外层控制流很克制”，而不是“底层执行器自带硬上限”。
+如果未来还有别的模块复用这同一个全局线程池，现有的资源边界分析就需要重新做。
 
-\paragraph{第二，文本输入仍然停留在主线程解析。}
-\texttt{*.mat} 路径已经具备较适合派发的任务形态，而 \texttt{*.txt} 路径仍然在主线程完成解析，
-随后再把 \texttt{io::Matrix} 提交给线程池。当前做法强调错误定位与控制流清晰，
-但若文本输入在某些工作负载下成为瓶颈，则可能需要进一步考虑并行文本解析。
-这一演化会同时带来更复杂的输入游标协议、错误定位与行列一致性诊断问题。
+\paragraph{第二，ordered commit 天然带来 head-of-line blocking。}
+当前设计最大优点是顺序语义清爽，最大代价也是顺序语义太清爽：
+一旦较早的 testcase 明显更慢，writer 就必须在它的 future 上等待，
+后面已经 ready 的 packet 不能越过它。若未来 profiling 表明这类阻塞成为关键瓶颈，
+那才值得重新引入显式完成包缓存、按 index 提交的真正 reorder buffer。
+但那会立刻把状态机重新变复杂，因此不应在没有证据时过早优化。
 
-\paragraph{第三，pipeline 级并发不等价于显式 CUDA stream 流水线。}
-当前 worker 任务虽然可以并发提交主机侧工作，但这并不等价于显式的
-\[
-    \text{host decode}
-    \parallel
-    \text{host-device copy}
-    \parallel
-    \text{kernel}
-    \parallel
-    \text{device-host copy}
-\]
-多阶段 CUDA stream 流水线。若要进一步挖掘设备侧重叠，
-则需要 kernel 层暴露异步接口、stream 与事件（event）语义，并由更外层协议显式管理生命周期；
-这不应在当前 pipeline 层中隐式引入。
+\paragraph{第三，主机侧并发不等于设备侧并发。}
+多个 worker 线程可以同时调用 \texttt{one\_sided\_jacobi\_svd()}，
+但这并不自动意味着 GPU 上就会出现理想的 kernel 重叠
+（kernel overlap）。设备端是否真正并行，仍取决于 CUDA runtime、stream 使用方式、
+显存压力和底层硬件资源。当前 pipeline 优化的是\textbf{端到端任务组织}，
+而不是承诺单 GPU 上一定存在某种特定重叠模式。
 
-\paragraph{第四，报告接口仍偏向语义报告，而非完整遥测。}
-\texttt{PipelineReport} 当前主要报告 testcase 数量、输出矩阵数量、sweep 总数以及布局转置的运行时配置。
-它尚未覆盖每阶段耗时、future 阻塞次数、完成队列等待时间、重排序缓冲区峰值占用等性能指标。
-如果未来需要系统地分析吞吐瓶颈，更合理的方向是新增独立 profiling/telemetry 结构，
-而不是让现有报告对象持续承担调试与性能观测职责。
+\paragraph{第四，\texttt{*.txt} 路径仍然把解析留在主线程。}
+这让文本输入的错误定位和控制流都更简单，也更符合“文本是兼容路径而不是高吞吐路径”的定位。
+但它同时意味着：若输入瓶颈发生在文本解析上，当前并发模型并不会替你 magically 消除它。
+未来若真要并行化文本路径，需要单独设计解析任务边界，而不是把当前 \texttt{TextTestcaseSource} 机械丢进线程池。
 
-\paragraph{第五，边界条件的当前策略是保守的 fail-fast 语义。}
-当前实现对缺失 packet、写线程失败、worker 异常和关闭阶段异常都采取快速失败策略，
-而不尝试在输出文件中保留部分成功结果，也不定义跳过坏 testcase 后继续执行的语义。
-这一选择有利于保持实验结果的可审计性，但也意味着若未来要支持部分恢复（partial recovery）、
-按 testcase 容错或断点续跑，则必须同步重写输出格式、关闭协议和报告语义。
+\paragraph{第五，\texttt{OutputPacket::testcase\_index} 目前更多是元数据，而不是提交控制键。}
+这很值得记一笔，因为它说明代码语义已经发生了实质性变化。
+旧模型下 index 是重排主键；新模型下 index 只是“这个 packet 对应谁”的事实记录。
+如果将来有人看到该字段就自然假设“writer 靠它排序”，那就会读错代码。
+文档必须把这个认知拐点讲清楚。
+
+\paragraph{第六，当前报告仍然偏向语义摘要，而不是完整遥测。}
+\texttt{PipelineReport} 会返回 testcase 数、已写矩阵数、总 sweep 数以及布局转置运行时配置；
+但它还不告诉我们 writer 在多少次 \texttt{future.get()} 上发生了明显等待，
+也不告诉我们 future 队列的峰值占用和队首阻塞持续时间。
+如果未来要严肃研究 pipeline 吞吐瓶颈，更合理的方向是增加 profiling/telemetry 结构，
+而不是继续把 \texttt{PipelineReport} 膨胀成调试日志容器。
+
+\paragraph{第七，当前失败语义仍然是保守的 fail-fast。}
+一旦 reader、worker 或 writer 任一环节确认失败，整次 \texttt{run()} 都会被判定为失败。
+系统不会尝试“跳过坏 testcase，继续写后面的好结果”，也不会承诺部分输出文件具有某种恢复协议
+（recovery protocol）。这种选择有利于实验结果的可审计性，但若未来要支持部分恢复、断点续跑或按 testcase 容错，
+就必须同步重写输出格式、报告语义与关闭协议。
 
 \subsection{小结}
 
-本章将 \texttt{pipeline.cpp} 重新定位为应用层聚合根（aggregate root）：它既不实现底层 I/O，
-也不参与单矩阵 SVD 的数值推导，而是负责把顺序输入、并发执行与有序输出组合成一个可验证的执行协议。
-围绕这一定位，系统采用全局线程池来集中管理主机侧并发，
-采用 future 窗口来限制 in-flight 任务数量，
-采用完成队列与重排序缓冲区来恢复输出顺序，
-并通过显式背压、关闭协议与异常传播保证资源边界与失败语义的一致性。
+本章把 \texttt{pipeline.cpp} 重新定位为应用层聚合根（aggregate root）：它既不实现底层 I/O，
+也不参与单矩阵 SVD 的数值推导，而是负责把顺序输入、并发计算与确定性输出组合成一个可验证的执行协议。
+与旧版文档相比，当前实现最关键的变化不是“线程更多了”，而是\textbf{顺序恢复机制换了形}：
+显式重排序缓冲区被收缩为按输入顺序提交的 future 队列，writer 在固定提交点上执行 \texttt{future.get()}，
+由此实现 ordered commit。
 
-因此，本章的重点并不在于“引入了线程池和重排序缓冲区”这一实现事实本身，
-而在于这些机制如何共同定义了一个有限、确定且可审计的应用层边界。
-对于本项目而言，\texttt{pipeline.cpp} 的价值并不是增加并发结构的数量，
-而是在输入有序、计算并发、完成乱序而输出仍需稳定有序的约束下，
-给出一个在吞吐、正确性与工程鲁棒性之间更平衡的系统组织方式。
+因此，这一章真正的重点并不在于几个类名，而在于新的并发模型如何平衡三件事：
+较高吞吐、稳定输出顺序和失败语义的诚实传播。它用全局线程池集中 host 侧并发，
+用有界 future admission 施加背压，用单 writer 保证文件顺序，
+再用显式关闭协议把所有线程中的异常收拢回 \texttt{run()}。
+从 systems 角度看，这是一种更收缩、也更容易推理的设计；代价则是明确接受队首阻塞。
+这份取舍本身，就是当前 \texttt{pipeline.cpp} 的核心思想。
