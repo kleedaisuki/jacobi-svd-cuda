@@ -799,7 +799,18 @@ namespace jacobi::svd::pipeline
         const MatrixFileFormat input_format = resolve_file_format(config_.input_format, config_.input_path);
         const MatrixFileFormat output_format = resolve_file_format(config_.output_format, config_.output_path);
 
-        KernelStage kernel(config_.kernel_config);
+        JacobiSvdConfig runtime_kernel_config = config_.kernel_config;
+        LayoutTransposeAutoTuneReport tuning_report{};
+        if (runtime_kernel_config.layout_transpose_auto_tune &&
+            runtime_kernel_config.layout_transpose_mode == LayoutTransposeMode::auto_select)
+        {
+            tuning_report = auto_tune_layout_transpose_threshold(runtime_kernel_config);
+            runtime_kernel_config.layout_transpose_min_columns = tuning_report.recommended_min_columns;
+            runtime_kernel_config.layout_transpose_min_elements = tuning_report.recommended_min_elements;
+            runtime_kernel_config.layout_transpose_auto_tune = false;
+        }
+
+        KernelStage kernel(runtime_kernel_config);
         ReorderBufferOutputStage output(config_.output_path, output_format, config_.max_queued_results);
         GlobalThreadPool &pool = global_thread_pool();
 
@@ -911,6 +922,11 @@ namespace jacobi::svd::pipeline
             report.testcase_count = submitted_count;
             report.emitted_matrix_count = submitted_count * 3;
             report.total_sweeps = total_sweeps.load(std::memory_order_relaxed);
+            report.layout_transpose_mode = runtime_kernel_config.layout_transpose_mode;
+            report.layout_transpose_min_columns = runtime_kernel_config.layout_transpose_min_columns;
+            report.layout_transpose_min_elements = runtime_kernel_config.layout_transpose_min_elements;
+            report.layout_transpose_auto_tuned = tuning_report.executed;
+            report.layout_transpose_estimated_best_speedup = tuning_report.estimated_best_speedup;
             return report;
         }
         catch (...)

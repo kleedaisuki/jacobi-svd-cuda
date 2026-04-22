@@ -98,6 +98,36 @@ namespace jacobi::svd::cli
         int threads_per_block = 256;
 
         /**
+         * @brief 布局转置策略；Layout-transpose policy.
+         */
+        LayoutTransposeMode layout_transpose_mode = LayoutTransposeMode::auto_select;
+
+        /**
+         * @brief 自动策略下布局转置最小列数阈值；Auto-mode minimum-column threshold for layout transpose.
+         */
+        int layout_transpose_min_columns = 16;
+
+        /**
+         * @brief 自动策略下布局转置最小元素阈值；Auto-mode minimum-element threshold for layout transpose.
+         */
+        std::size_t layout_transpose_min_elements = 4096;
+
+        /**
+         * @brief 是否执行布局转置阈值自动调优；Whether to run layout-transpose threshold auto-tuning.
+         */
+        bool layout_transpose_auto_tune = false;
+
+        /**
+         * @brief 自动调优时每个尺寸的重复次数；Per-size repetitions during auto-tuning.
+         */
+        int layout_transpose_benchmark_repetitions = 2;
+
+        /**
+         * @brief 自动调优时每次基准的 sweep 上限；Sweep cap per benchmark run during auto-tuning.
+         */
+        int layout_transpose_benchmark_sweeps = 8;
+
+        /**
          * @brief 输出队列容量；Output queue capacity.
          */
         std::size_t queue_capacity = 4;
@@ -193,6 +223,36 @@ namespace jacobi::svd::cli
          * @brief 队列容量选项；Queue-capacity option.
          */
         queue_capacity,
+
+        /**
+         * @brief 布局转置策略选项；Layout-transpose policy option.
+         */
+        layout_transpose_mode,
+
+        /**
+         * @brief 布局转置最小列数阈值选项；Layout-transpose minimum-column threshold option.
+         */
+        layout_transpose_min_columns,
+
+        /**
+         * @brief 布局转置最小元素阈值选项；Layout-transpose minimum-element threshold option.
+         */
+        layout_transpose_min_elements,
+
+        /**
+         * @brief 布局转置阈值自动调优选项；Layout-transpose threshold auto-tuning option.
+         */
+        layout_transpose_auto_tune,
+
+        /**
+         * @brief 自动调优重复次数选项；Auto-tuning repetitions option.
+         */
+        layout_transpose_benchmark_repetitions,
+
+        /**
+         * @brief 自动调优 sweep 上限选项；Auto-tuning sweep-cap option.
+         */
+        layout_transpose_benchmark_sweeps,
 
         /**
          * @brief force 閫夐」锛沠orce-overwrite option.
@@ -408,6 +468,32 @@ namespace jacobi::svd::cli
     }
 
     /**
+     * @brief 解析布局转置策略文本；Parse layout-transpose mode string.
+     * @param raw 文本值；Raw text value.
+     * @param option_name 选项名；Option name.
+     * @return 布局转置策略；Layout-transpose mode.
+     */
+    [[nodiscard]] LayoutTransposeMode parse_layout_transpose_mode(std::string_view raw, std::string_view option_name)
+    {
+        const std::string lowered = to_lower_ascii(raw);
+        if (lowered == "auto")
+        {
+            return LayoutTransposeMode::auto_select;
+        }
+        if (lowered == "on")
+        {
+            return LayoutTransposeMode::force_enable;
+        }
+        if (lowered == "off")
+        {
+            return LayoutTransposeMode::force_disable;
+        }
+
+        throw CliArgumentError("Invalid value for --" + std::string(option_name) +
+                               ": expected one of {auto, on, off}.");
+    }
+
+    /**
      * @brief 将文件格式转为字符串；Convert file format to string.
      * @param format 格式枚举；Format enum.
      * @return 字符串表示；String representation.
@@ -424,6 +510,25 @@ namespace jacobi::svd::cli
             return "txt";
         }
 
+        return "unknown";
+    }
+
+    /**
+     * @brief 将布局转置策略转为字符串；Convert layout-transpose mode to string.
+     * @param mode 布局转置策略；Layout-transpose mode.
+     * @return 字符串表示；String representation.
+     */
+    [[nodiscard]] std::string_view layout_transpose_mode_to_string(LayoutTransposeMode mode)
+    {
+        switch (mode)
+        {
+        case LayoutTransposeMode::auto_select:
+            return "auto";
+        case LayoutTransposeMode::force_enable:
+            return "on";
+        case LayoutTransposeMode::force_disable:
+            return "off";
+        }
         return "unknown";
     }
 
@@ -689,6 +794,12 @@ namespace jacobi::svd::cli
             .epsilon = options.epsilon,
             .max_sweeps = options.max_sweeps,
             .threads_per_block = options.threads_per_block,
+            .layout_transpose_mode = options.layout_transpose_mode,
+            .layout_transpose_min_columns = options.layout_transpose_min_columns,
+            .layout_transpose_min_elements = options.layout_transpose_min_elements,
+            .layout_transpose_auto_tune = options.layout_transpose_auto_tune,
+            .layout_transpose_benchmark_repetitions = options.layout_transpose_benchmark_repetitions,
+            .layout_transpose_benchmark_sweeps = options.layout_transpose_benchmark_sweeps,
         };
         return config;
     }
@@ -710,6 +821,12 @@ namespace jacobi::svd::cli
         std::cout << "epsilon         : " << options.epsilon << '\n';
         std::cout << "max-sweeps      : " << options.max_sweeps << '\n';
         std::cout << "threads-per-blk : " << options.threads_per_block << '\n';
+        std::cout << "layout-mode     : " << layout_transpose_mode_to_string(options.layout_transpose_mode) << '\n';
+        std::cout << "layout-min-cols : " << options.layout_transpose_min_columns << '\n';
+        std::cout << "layout-min-elem : " << options.layout_transpose_min_elements << '\n';
+        std::cout << "layout-auto-tune: " << (options.layout_transpose_auto_tune ? "true" : "false") << '\n';
+        std::cout << "layout-bench-rep: " << options.layout_transpose_benchmark_repetitions << '\n';
+        std::cout << "layout-bench-swp: " << options.layout_transpose_benchmark_sweeps << '\n';
         std::cout << "queue-capacity  : " << options.queue_capacity << '\n';
         std::cout << "force-overwrite : " << (options.force_overwrite ? "true" : "false") << '\n';
     }
@@ -724,6 +841,12 @@ namespace jacobi::svd::cli
         std::cout << "testcases       : " << report.testcase_count << '\n';
         std::cout << "emitted-matrices: " << report.emitted_matrix_count << '\n';
         std::cout << "total-sweeps    : " << report.total_sweeps << '\n';
+        std::cout << "layout-mode     : " << layout_transpose_mode_to_string(report.layout_transpose_mode) << '\n';
+        std::cout << "layout-min-cols : " << report.layout_transpose_min_columns << '\n';
+        std::cout << "layout-min-elem : " << report.layout_transpose_min_elements << '\n';
+        std::cout << "layout-auto-tune: " << (report.layout_transpose_auto_tuned ? "true" : "false") << '\n';
+        std::cout << "layout-best-spd : " << std::fixed << std::setprecision(3)
+                  << report.layout_transpose_estimated_best_speedup << '\n';
         std::cout << "elapsed-ms      : " << std::fixed << std::setprecision(3)
                   << elapsed_milliseconds << '\n';
     }
@@ -738,6 +861,14 @@ namespace jacobi::svd::cli
         std::cout << "  \"testcase_count\": " << report.testcase_count << ",\n";
         std::cout << "  \"emitted_matrix_count\": " << report.emitted_matrix_count << ",\n";
         std::cout << "  \"total_sweeps\": " << report.total_sweeps << ",\n";
+        std::cout << "  \"layout_transpose_mode\": \""
+                  << layout_transpose_mode_to_string(report.layout_transpose_mode) << "\",\n";
+        std::cout << "  \"layout_transpose_min_columns\": " << report.layout_transpose_min_columns << ",\n";
+        std::cout << "  \"layout_transpose_min_elements\": " << report.layout_transpose_min_elements << ",\n";
+        std::cout << "  \"layout_transpose_auto_tuned\": "
+                  << (report.layout_transpose_auto_tuned ? "true" : "false") << ",\n";
+        std::cout << "  \"layout_transpose_estimated_best_speedup\": " << std::fixed << std::setprecision(3)
+                  << report.layout_transpose_estimated_best_speedup << ",\n";
         std::cout << "  \"elapsed_ms\": " << std::fixed << std::setprecision(3)
                   << elapsed_milliseconds << '\n';
         std::cout << "}\n";
@@ -753,6 +884,18 @@ namespace jacobi::svd::cli
               {OptionId::epsilon, "epsilon", 'e', true, "NUM", "Convergence epsilon (>0)."},
               {OptionId::max_sweeps, "max-sweeps", 's', true, "N", "Maximum sweep count (>0)."},
               {OptionId::threads_per_block, "threads-per-block", 't', true, "N", "CUDA threads per block (>0)."},
+              {OptionId::layout_transpose_mode, "layout-transpose-mode", '\0', true, "MODE",
+               "Layout-transpose mode: auto|on|off."},
+              {OptionId::layout_transpose_min_columns, "layout-transpose-min-cols", '\0', true, "N",
+               "Auto-mode threshold: minimum columns (>0)."},
+              {OptionId::layout_transpose_min_elements, "layout-transpose-min-elems", '\0', true, "N",
+               "Auto-mode threshold: minimum elements (>0)."},
+              {OptionId::layout_transpose_auto_tune, "layout-transpose-auto-tune", '\0', false, "",
+               "Run micro-benchmark to auto-tune layout thresholds before pipeline."},
+              {OptionId::layout_transpose_benchmark_repetitions, "layout-transpose-bench-reps", '\0', true, "N",
+               "Auto-tune repetitions per scanned matrix size (>0)."},
+              {OptionId::layout_transpose_benchmark_sweeps, "layout-transpose-bench-sweeps", '\0', true, "N",
+               "Auto-tune sweep cap per benchmark run (>0)."},
               {OptionId::queue_capacity, "queue-capacity", 'c', true, "N", "In-flight/reorder window size (>0)."},
               {OptionId::force, "force", 'y', false, "", "Overwrite existing output file."},
               {OptionId::dry_run, "dry-run", '\0', false, "", "Validate arguments and print config only."},
@@ -872,6 +1015,8 @@ namespace jacobi::svd::cli
         stream << "  " << executable << " experiments/inputs/a.mat --print-config\n";
         stream << "  " << executable << " input.txt output.txt --format txt --epsilon 1e-10\n";
         stream << "  " << executable << " --input a.mat --output b.txt --output-format txt --json-report --force\n";
+        stream << "  " << executable
+               << " --input a.mat --layout-transpose-auto-tune --layout-transpose-mode auto\n";
         stream << "\nNotes:\n";
         stream << "  - When [output] is omitted, default output is <input-stem>.svd.{mat|txt}.\n";
         stream << "  - Existing output file requires --force to overwrite.\n";
@@ -992,6 +1137,24 @@ namespace jacobi::svd::cli
             return;
         case OptionId::threads_per_block:
             result.options.threads_per_block = parse_positive_int(value.value(), option.long_name);
+            return;
+        case OptionId::layout_transpose_mode:
+            result.options.layout_transpose_mode = parse_layout_transpose_mode(value.value(), option.long_name);
+            return;
+        case OptionId::layout_transpose_min_columns:
+            result.options.layout_transpose_min_columns = parse_positive_int(value.value(), option.long_name);
+            return;
+        case OptionId::layout_transpose_min_elements:
+            result.options.layout_transpose_min_elements = parse_positive_size(value.value(), option.long_name);
+            return;
+        case OptionId::layout_transpose_auto_tune:
+            result.options.layout_transpose_auto_tune = true;
+            return;
+        case OptionId::layout_transpose_benchmark_repetitions:
+            result.options.layout_transpose_benchmark_repetitions = parse_positive_int(value.value(), option.long_name);
+            return;
+        case OptionId::layout_transpose_benchmark_sweeps:
+            result.options.layout_transpose_benchmark_sweeps = parse_positive_int(value.value(), option.long_name);
             return;
         case OptionId::queue_capacity:
             result.options.queue_capacity = parse_positive_size(value.value(), option.long_name);

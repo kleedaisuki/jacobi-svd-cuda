@@ -3,10 +3,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <sstream>
@@ -192,6 +195,191 @@ namespace jacobi::svd
         }
 
         /**
+         * @brief 列主序索引映射；Column-major index mapping.
+         * @param row 行索引；Row index.
+         * @param col 列索引；Column index.
+         * @param rows 总行数；Total rows.
+         * @return 一维偏移；Linear offset.
+         */
+        __host__ __device__ inline int column_major_index(int row, int col, int rows)
+        {
+            return col * rows + row;
+        }
+
+        /**
+         * @brief 按策略返回矩阵索引；Return matrix index by layout policy.
+         * @tparam ColumnMajor 是否列主序；Whether layout is column-major.
+         * @param row 行索引；Row index.
+         * @param col 列索引；Column index.
+         * @param rows 总行数；Total rows.
+         * @param columns 总列数；Total columns.
+         * @return 一维偏移；Linear offset.
+         */
+        template <bool ColumnMajor>
+        __host__ __device__ inline int matrix_index(int row, int col, int rows, int columns)
+        {
+            if constexpr (ColumnMajor)
+            {
+                return column_major_index(row, col, rows);
+            }
+            return row_major_index(row, col, columns);
+        }
+
+        /**
+         * @brief 转置 tile 边长；Transpose tile width/height.
+         */
+        constexpr int k_transpose_tile_dim = 32;
+
+        /**
+         * @brief 转置 block 的行步进；Row-stride inside transpose block.
+         */
+        constexpr int k_transpose_block_rows = 8;
+
+        /**
+         * @brief 行主序矩阵转置核；Row-major matrix transpose kernel.
+         * @param src 输入矩阵（行主序，src_rows x src_cols）；Input matrix (row-major, src_rows x src_cols).
+         * @param dst 输出矩阵（行主序，src_cols x src_rows）；Output matrix (row-major, src_cols x src_rows).
+         * @param src_rows 输入行数；Input row count.
+         * @param src_cols 输入列数；Input column count.
+         * @note 使用共享内存 tile，分别保证读写阶段的内存合并；Uses shared-memory tiles to coalesce both read and write phases.
+         */
+        __global__ void transpose_row_major_kernel(const double *src, double *dst, int src_rows, int src_cols)
+        {
+            __shared__ double tile[k_transpose_tile_dim][k_transpose_tile_dim + 1];
+
+            const int x = static_cast<int>(blockIdx.x * k_transpose_tile_dim + threadIdx.x);
+            const int y = static_cast<int>(blockIdx.y * k_transpose_tile_dim + threadIdx.y);
+
+            for (int offset = 0; offset < k_transpose_tile_dim; offset += k_transpose_block_rows)
+            {
+                const int src_row = y + offset;
+                if (x < src_cols && src_row < src_rows)
+                {
+                    tile[threadIdx.y + offset][threadIdx.x] = src[row_major_index(src_row, x, src_cols)];
+                }
+            }
+            __syncthreads();
+
+            const int transposed_x = static_cast<int>(blockIdx.y * k_transpose_tile_dim + threadIdx.x);
+            const int transposed_y = static_cast<int>(blockIdx.x * k_transpose_tile_dim + threadIdx.y);
+
+            for (int offset = 0; offset < k_transpose_tile_dim; offset += k_transpose_block_rows)
+            {
+                const int dst_row = transposed_y + offset;
+                if (transposed_x < src_rows && dst_row < src_cols)
+                {
+                    dst[row_major_index(dst_row, transposed_x, src_rows)] =
+                        tile[threadIdx.x][threadIdx.y + offset];
+                }
+            }
+        }
+
+        /**
+         * @brief 启动 row-major 到 column-major 的布局转置；Launch layout transpose from row-major to column-major.
+         * @param src_row_major 输入逻辑矩阵（行主序，rows x columns）；Input logical matrix (row-major, rows x columns).
+         * @param dst_column_major 输出逻辑矩阵（列主序，rows x columns）；Output logical matrix (column-major, rows x columns).
+         * @param rows 逻辑行数；Logical row count.
+         * @param columns 逻辑列数；Logical column count.
+         * @note 通过“row-major 转置”实现布局重排；Layout conversion is implemented via a row-major transpose.
+         */
+        void launch_row_to_column_layout_transpose(const double *src_row_major,
+                                                   double *dst_column_major,
+                                                   int rows,
+                                                   int columns)
+        {
+            const dim3 block(static_cast<unsigned int>(k_transpose_tile_dim),
+                             static_cast<unsigned int>(k_transpose_block_rows),
+                             1U);
+            const dim3 grid(static_cast<unsigned int>((columns + k_transpose_tile_dim - 1) / k_transpose_tile_dim),
+                            static_cast<unsigned int>((rows + k_transpose_tile_dim - 1) / k_transpose_tile_dim),
+                            1U);
+            transpose_row_major_kernel<<<grid, block>>>(src_row_major, dst_column_major, rows, columns);
+            JACOBI_CUDA_CHECK(cudaGetLastError());
+        }
+
+        /**
+         * @brief 启动 column-major 到 row-major 的布局转置；Launch layout transpose from column-major to row-major.
+         * @param src_column_major 输入逻辑矩阵（列主序，rows x columns）；Input logical matrix (column-major, rows x columns).
+         * @param dst_row_major 输出逻辑矩阵（行主序，rows x columns）；Output logical matrix (row-major, rows x columns).
+         * @param rows 逻辑行数；Logical row count.
+         * @param columns 逻辑列数；Logical column count.
+         * @note 源缓冲区按 row-major(cols x rows) 解释后再转置回 row-major(rows x columns)；Interpret source as row-major(cols x rows), then transpose back.
+         */
+        void launch_column_to_row_layout_transpose(const double *src_column_major,
+                                                   double *dst_row_major,
+                                                   int rows,
+                                                   int columns)
+        {
+            const dim3 block(static_cast<unsigned int>(k_transpose_tile_dim),
+                             static_cast<unsigned int>(k_transpose_block_rows),
+                             1U);
+            const dim3 grid(static_cast<unsigned int>((rows + k_transpose_tile_dim - 1) / k_transpose_tile_dim),
+                            static_cast<unsigned int>((columns + k_transpose_tile_dim - 1) / k_transpose_tile_dim),
+                            1U);
+            transpose_row_major_kernel<<<grid, block>>>(src_column_major, dst_row_major, columns, rows);
+            JACOBI_CUDA_CHECK(cudaGetLastError());
+        }
+
+        /**
+         * @brief 计算矩阵元素数量；Compute matrix element count.
+         * @param rows 行数；Row count.
+         * @param columns 列数；Column count.
+         * @return 元素数量；Element count.
+         */
+        [[nodiscard]] std::size_t matrix_element_count(std::size_t rows, std::size_t columns)
+        {
+            return rows * columns;
+        }
+
+        /**
+         * @brief 校验布局转置配置；Validate layout-transpose related configuration.
+         * @param config 算法配置；Algorithm configuration.
+         */
+        void validate_layout_transpose_config(const JacobiSvdConfig &config)
+        {
+            if (config.layout_transpose_min_columns <= 0)
+            {
+                throw std::invalid_argument("layout_transpose_min_columns must be positive.");
+            }
+            if (config.layout_transpose_min_elements == 0)
+            {
+                throw std::invalid_argument("layout_transpose_min_elements must be positive.");
+            }
+            if (config.layout_transpose_benchmark_repetitions <= 0)
+            {
+                throw std::invalid_argument("layout_transpose_benchmark_repetitions must be positive.");
+            }
+            if (config.layout_transpose_benchmark_sweeps <= 0)
+            {
+                throw std::invalid_argument("layout_transpose_benchmark_sweeps must be positive.");
+            }
+        }
+
+        /**
+         * @brief 判断是否启用布局转置路径；Decide whether to enable layout-transpose path.
+         * @param rows 行数；Row count.
+         * @param columns 列数；Column count.
+         * @param config 算法配置；Algorithm configuration.
+         * @return true 表示启用布局转置；true if layout transpose should be enabled.
+         */
+        [[nodiscard]] bool should_use_layout_transpose(int rows, int columns, const JacobiSvdConfig &config)
+        {
+            if (config.layout_transpose_mode == LayoutTransposeMode::force_enable)
+            {
+                return true;
+            }
+            if (config.layout_transpose_mode == LayoutTransposeMode::force_disable)
+            {
+                return false;
+            }
+
+            const std::size_t element_count =
+                matrix_element_count(static_cast<std::size_t>(rows), static_cast<std::size_t>(columns));
+            return columns >= config.layout_transpose_min_columns &&
+                   element_count >= config.layout_transpose_min_elements;
+        }
+
+        /**
          * @brief 初始化单位矩阵 V；Initialize identity matrix V.
          * @param v 输出矩阵指针；Output matrix pointer.
          * @param n 方阵维度；Square dimension.
@@ -221,6 +409,7 @@ namespace jacobi::svd
          * @param a_qq 输出 A_q 点积；Output A_q dot A_q.
          * @param a_pq 输出 A_p 与 A_q 点积；Output A_p dot A_q.
          */
+        template <bool ColumnMajorA>
         __global__ void pair_stats_kernel(const double *a,
                                           int m,
                                           int n,
@@ -246,8 +435,8 @@ namespace jacobi::svd
 
             for (int row = tid; row < m; row += static_cast<int>(blockDim.x))
             {
-                const double ap = a[row_major_index(row, p, n)];
-                const double aq = a[row_major_index(row, q, n)];
+                const double ap = a[matrix_index<ColumnMajorA>(row, p, m, n)];
+                const double aq = a[matrix_index<ColumnMajorA>(row, q, m, n)];
                 local_pp += ap * ap;
                 local_qq += aq * aq;
                 local_pq += ap * aq;
@@ -342,6 +531,7 @@ namespace jacobi::svd
          * @param c cos(theta) 数组；cos(theta) array.
          * @param s sin(theta) 数组；sin(theta) array.
          */
+        template <bool ColumnMajorA>
         __global__ void apply_rotation_kernel(double *a,
                                               double *v,
                                               int m,
@@ -365,8 +555,8 @@ namespace jacobi::svd
 
             for (int row = tid; row < m; row += static_cast<int>(blockDim.x))
             {
-                const int idx_p = row_major_index(row, p, n);
-                const int idx_q = row_major_index(row, q, n);
+                const int idx_p = matrix_index<ColumnMajorA>(row, p, m, n);
+                const int idx_q = matrix_index<ColumnMajorA>(row, q, m, n);
                 const double value_p = a[idx_p];
                 const double value_q = a[idx_q];
                 a[idx_p] = cosine * value_p - sine * value_q;
@@ -605,144 +795,334 @@ namespace jacobi::svd
         return host;
     }
 
+    namespace
+    {
+        /**
+         * @brief 校验单边雅可比输入参数；Validate one-sided Jacobi input arguments.
+         * @param host_input 输入缓存；Input buffer.
+         * @param rows 行数；Row count.
+         * @param columns 列数；Column count.
+         * @param config 算法配置；Algorithm configuration.
+         */
+        void validate_one_sided_inputs(std::span<const double> host_input,
+                                       std::size_t rows,
+                                       std::size_t columns,
+                                       const JacobiSvdConfig &config)
+        {
+            if (rows == 0 || columns == 0)
+            {
+                throw std::invalid_argument("Input matrix shape must be non-zero.");
+            }
+            if (rows < columns)
+            {
+                throw std::invalid_argument("One-sided Jacobi SVD requires rows >= columns in this implementation.");
+            }
+            if (host_input.size() != matrix_element_count(rows, columns))
+            {
+                throw std::invalid_argument("Input buffer size mismatch.");
+            }
+            if (config.epsilon <= 0.0)
+            {
+                throw std::invalid_argument("epsilon must be positive.");
+            }
+            if (config.max_sweeps <= 0)
+            {
+                throw std::invalid_argument("max_sweeps must be positive.");
+            }
+            validate_layout_transpose_config(config);
+        }
+
+        /**
+         * @brief 内部执行单边雅可比 SVD；Internal executor for one-sided Jacobi SVD.
+         * @param host_input 输入矩阵（行主序）；Input matrix (row-major).
+         * @param rows 行数；Row count.
+         * @param columns 列数；Column count.
+         * @param config 算法配置；Algorithm configuration.
+         * @param use_layout_transpose 是否启用布局转置路径；Whether to use layout-transpose path.
+         * @return SVD 结果；SVD result.
+         */
+        [[nodiscard]] JacobiSvdResult run_one_sided_jacobi_svd_internal(std::span<const double> host_input,
+                                                                         std::size_t rows,
+                                                                         std::size_t columns,
+                                                                         const JacobiSvdConfig &config,
+                                                                         bool use_layout_transpose)
+        {
+            const int m = static_cast<int>(rows);
+            const int n = static_cast<int>(columns);
+            const int threads = normalize_threads_per_block(config.threads_per_block);
+
+            DeviceMatrix d_a(rows, columns);
+            DeviceMatrix d_a_layout;
+            DeviceMatrix d_v(columns, columns);
+            DeviceMatrix d_u(rows, columns);
+            DeviceMatrix d_sigma(1, columns);
+
+            d_a.copy_from_host(host_input);
+            if (use_layout_transpose)
+            {
+                d_a_layout.reset(rows, columns);
+                launch_row_to_column_layout_transpose(d_a.data(), d_a_layout.data(), m, n);
+            }
+
+            const int identity_total = n * n;
+            const int identity_blocks = (identity_total + threads - 1) / threads;
+            initialize_identity_kernel<<<identity_blocks, threads>>>(d_v.data(), n);
+            JACOBI_CUDA_CHECK(cudaGetLastError());
+
+            const auto rounds = build_round_robin_schedule(n);
+            std::size_t max_pairs = 0;
+            for (const auto &round : rounds)
+            {
+                max_pairs = std::max(max_pairs, round.size());
+            }
+
+            DeviceBuffer<int2> d_pairs(max_pairs);
+            DeviceBuffer<double> d_app(max_pairs);
+            DeviceBuffer<double> d_aqq(max_pairs);
+            DeviceBuffer<double> d_apq(max_pairs);
+            DeviceBuffer<double> d_c(max_pairs);
+            DeviceBuffer<double> d_s(max_pairs);
+            DeviceBuffer<int> d_any_rotation(1);
+
+            int executed_sweeps = 0;
+
+            for (int sweep = 0; sweep < config.max_sweeps; ++sweep)
+            {
+                bool converged_this_sweep = true;
+
+                for (const auto &round : rounds)
+                {
+                    const int pair_count = static_cast<int>(round.size());
+                    if (pair_count == 0)
+                    {
+                        continue;
+                    }
+
+                    JACOBI_CUDA_CHECK(cudaMemcpy(d_pairs.data(),
+                                                 round.data(),
+                                                 static_cast<std::size_t>(pair_count) * sizeof(int2),
+                                                 cudaMemcpyHostToDevice));
+                    JACOBI_CUDA_CHECK(cudaMemset(d_any_rotation.data(), 0, sizeof(int)));
+
+                    const std::size_t shared_bytes_stats = static_cast<std::size_t>(threads) * 3 * sizeof(double);
+                    if (use_layout_transpose)
+                    {
+                        pair_stats_kernel<true><<<pair_count, threads, shared_bytes_stats>>>(d_a_layout.data(),
+                                                                                              m,
+                                                                                              n,
+                                                                                              d_pairs.data(),
+                                                                                              pair_count,
+                                                                                              d_app.data(),
+                                                                                              d_aqq.data(),
+                                                                                              d_apq.data());
+                    }
+                    else
+                    {
+                        pair_stats_kernel<false><<<pair_count, threads, shared_bytes_stats>>>(d_a.data(),
+                                                                                               m,
+                                                                                               n,
+                                                                                               d_pairs.data(),
+                                                                                               pair_count,
+                                                                                               d_app.data(),
+                                                                                               d_aqq.data(),
+                                                                                               d_apq.data());
+                    }
+                    JACOBI_CUDA_CHECK(cudaGetLastError());
+
+                    const int rotation_blocks = (pair_count + threads - 1) / threads;
+                    compute_rotation_params_kernel<<<rotation_blocks, threads>>>(d_app.data(),
+                                                                                 d_aqq.data(),
+                                                                                 d_apq.data(),
+                                                                                 pair_count,
+                                                                                 config.epsilon,
+                                                                                 d_c.data(),
+                                                                                 d_s.data(),
+                                                                                 d_any_rotation.data());
+                    JACOBI_CUDA_CHECK(cudaGetLastError());
+
+                    if (use_layout_transpose)
+                    {
+                        apply_rotation_kernel<true><<<pair_count, threads>>>(d_a_layout.data(),
+                                                                             d_v.data(),
+                                                                             m,
+                                                                             n,
+                                                                             d_pairs.data(),
+                                                                             pair_count,
+                                                                             d_c.data(),
+                                                                             d_s.data());
+                    }
+                    else
+                    {
+                        apply_rotation_kernel<false><<<pair_count, threads>>>(d_a.data(),
+                                                                              d_v.data(),
+                                                                              m,
+                                                                              n,
+                                                                              d_pairs.data(),
+                                                                              pair_count,
+                                                                              d_c.data(),
+                                                                              d_s.data());
+                    }
+                    JACOBI_CUDA_CHECK(cudaGetLastError());
+
+                    int any_rotation = 0;
+                    JACOBI_CUDA_CHECK(
+                        cudaMemcpy(&any_rotation, d_any_rotation.data(), sizeof(int), cudaMemcpyDeviceToHost));
+                    if (any_rotation != 0)
+                    {
+                        converged_this_sweep = false;
+                    }
+                }
+
+                executed_sweeps = sweep + 1;
+                if (converged_this_sweep)
+                {
+                    break;
+                }
+            }
+
+            const double *u_sigma_input = d_a.data();
+            if (use_layout_transpose)
+            {
+                launch_column_to_row_layout_transpose(d_a_layout.data(), d_a.data(), m, n);
+                u_sigma_input = d_a.data();
+            }
+
+            const std::size_t shared_bytes_norm = static_cast<std::size_t>(threads) * sizeof(double);
+            build_u_sigma_kernel<<<n, threads, shared_bytes_norm>>>(
+                u_sigma_input, d_u.data(), d_sigma.data(), m, n, config.epsilon);
+            JACOBI_CUDA_CHECK(cudaGetLastError());
+            JACOBI_CUDA_CHECK(cudaDeviceSynchronize());
+
+            JacobiSvdResult result;
+            result.rows = rows;
+            result.columns = columns;
+            result.sweeps = executed_sweeps;
+            result.u = d_u.copy_to_host();
+            result.sigma = d_sigma.copy_to_host();
+            result.v = d_v.copy_to_host();
+            return result;
+        }
+
+        /**
+         * @brief 构造基准输入矩阵；Build benchmark input matrix.
+         * @param rows 行数；Row count.
+         * @param columns 列数；Column count.
+         * @return 行主序矩阵数据；Row-major matrix data.
+         */
+        [[nodiscard]] std::vector<double> build_benchmark_matrix(std::size_t rows, std::size_t columns)
+        {
+            std::vector<double> values(matrix_element_count(rows, columns), 0.0);
+            for (std::size_t row = 0; row < rows; ++row)
+            {
+                for (std::size_t col = 0; col < columns; ++col)
+                {
+                    const double lhs = std::sin(0.013 * static_cast<double>((row + 1) * (col + 1)));
+                    const double rhs = std::cos(0.017 * static_cast<double>((row + 3) * (col + 5)));
+                    values[row * columns + col] = lhs + rhs;
+                }
+            }
+            return values;
+        }
+
+        /**
+         * @brief 评估单一路径平均耗时；Measure average latency of one path.
+         * @param host_input 输入矩阵；Input matrix.
+         * @param rows 行数；Row count.
+         * @param columns 列数；Column count.
+         * @param benchmark_config 基准配置；Benchmark configuration.
+         * @param use_layout_transpose 是否启用布局转置；Whether to use layout transpose.
+         * @return 平均耗时（毫秒）；Average latency in milliseconds.
+         */
+        [[nodiscard]] double benchmark_path_average_milliseconds(std::span<const double> host_input,
+                                                                 std::size_t rows,
+                                                                 std::size_t columns,
+                                                                 const JacobiSvdConfig &benchmark_config,
+                                                                 bool use_layout_transpose)
+        {
+            (void)run_one_sided_jacobi_svd_internal(host_input, rows, columns, benchmark_config, use_layout_transpose);
+
+            double accumulated_ms = 0.0;
+            int sweep_checksum = 0;
+            for (int repetition = 0; repetition < benchmark_config.layout_transpose_benchmark_repetitions; ++repetition)
+            {
+                const auto started_at = std::chrono::steady_clock::now();
+                const JacobiSvdResult result =
+                    run_one_sided_jacobi_svd_internal(host_input, rows, columns, benchmark_config, use_layout_transpose);
+                const auto finished_at = std::chrono::steady_clock::now();
+                sweep_checksum += result.sweeps;
+                accumulated_ms +=
+                    std::chrono::duration<double, std::milli>(finished_at - started_at).count();
+            }
+
+            if (sweep_checksum < 0)
+            {
+                throw std::runtime_error("Unreachable sweep checksum guard triggered.");
+            }
+
+            return accumulated_ms / static_cast<double>(benchmark_config.layout_transpose_benchmark_repetitions);
+        }
+    } // namespace
+
     JacobiSvdResult one_sided_jacobi_svd(std::span<const double> host_input,
                                          std::size_t rows,
                                          std::size_t columns,
                                          const JacobiSvdConfig &config)
     {
-        if (rows == 0 || columns == 0)
-        {
-            throw std::invalid_argument("Input matrix shape must be non-zero.");
-        }
-        if (rows < columns)
-        {
-            throw std::invalid_argument("One-sided Jacobi SVD requires rows >= columns in this implementation.");
-        }
-        if (host_input.size() != rows * columns)
-        {
-            throw std::invalid_argument("Input buffer size mismatch.");
-        }
-        if (config.epsilon <= 0.0)
-        {
-            throw std::invalid_argument("epsilon must be positive.");
-        }
+        validate_one_sided_inputs(host_input, rows, columns, config);
+
+        const bool use_layout_transpose =
+            should_use_layout_transpose(static_cast<int>(rows), static_cast<int>(columns), config);
+        return run_one_sided_jacobi_svd_internal(host_input, rows, columns, config, use_layout_transpose);
+    }
+
+    LayoutTransposeAutoTuneReport auto_tune_layout_transpose_threshold(const JacobiSvdConfig &config)
+    {
+        validate_layout_transpose_config(config);
         if (config.max_sweeps <= 0)
         {
             throw std::invalid_argument("max_sweeps must be positive.");
         }
 
-        const int m = static_cast<int>(rows);
-        const int n = static_cast<int>(columns);
-        const int threads = normalize_threads_per_block(config.threads_per_block);
+        JacobiSvdConfig benchmark_config = config;
+        benchmark_config.layout_transpose_auto_tune = false;
+        benchmark_config.layout_transpose_mode = LayoutTransposeMode::auto_select;
+        benchmark_config.max_sweeps =
+            std::min(config.max_sweeps, std::max(1, config.layout_transpose_benchmark_sweeps));
 
-        DeviceMatrix d_a(rows, columns);
-        DeviceMatrix d_v(columns, columns);
-        DeviceMatrix d_u(rows, columns);
-        DeviceMatrix d_sigma(1, columns);
+        constexpr std::array<int, 8> benchmark_columns = {8, 12, 16, 24, 32, 48, 64, 96};
 
-        d_a.copy_from_host(host_input);
+        LayoutTransposeAutoTuneReport report{};
+        report.executed = true;
+        report.recommended_min_columns = config.layout_transpose_min_columns;
+        report.recommended_min_elements = config.layout_transpose_min_elements;
+        report.estimated_best_speedup = 1.0;
+        report.sample_count = benchmark_columns.size();
 
-        const int identity_total = n * n;
-        const int identity_blocks = (identity_total + threads - 1) / threads;
-        initialize_identity_kernel<<<identity_blocks, threads>>>(d_v.data(), n);
-        JACOBI_CUDA_CHECK(cudaGetLastError());
+        bool threshold_selected = false;
 
-        const auto rounds = build_round_robin_schedule(n);
-        std::size_t max_pairs = 0;
-        for (const auto &round : rounds)
+        for (const int columns : benchmark_columns)
         {
-            max_pairs = std::max(max_pairs, round.size());
-        }
+            const std::size_t rows = static_cast<std::size_t>(columns * 2);
+            const std::size_t cols = static_cast<std::size_t>(columns);
+            const std::vector<double> host_input = build_benchmark_matrix(rows, cols);
 
-        DeviceBuffer<int2> d_pairs(max_pairs);
-        DeviceBuffer<double> d_app(max_pairs);
-        DeviceBuffer<double> d_aqq(max_pairs);
-        DeviceBuffer<double> d_apq(max_pairs);
-        DeviceBuffer<double> d_c(max_pairs);
-        DeviceBuffer<double> d_s(max_pairs);
-        DeviceBuffer<int> d_any_rotation(1);
+            const double direct_ms =
+                benchmark_path_average_milliseconds(host_input, rows, cols, benchmark_config, false);
+            const double transpose_ms =
+                benchmark_path_average_milliseconds(host_input, rows, cols, benchmark_config, true);
+            const double safe_transpose = std::max(transpose_ms, std::numeric_limits<double>::min());
+            const double speedup = direct_ms / safe_transpose;
+            report.estimated_best_speedup = std::max(report.estimated_best_speedup, speedup);
 
-        int executed_sweeps = 0;
-
-        for (int sweep = 0; sweep < config.max_sweeps; ++sweep)
-        {
-            bool converged_this_sweep = true;
-
-            for (const auto &round : rounds)
+            if (!threshold_selected && transpose_ms < direct_ms)
             {
-                const int pair_count = static_cast<int>(round.size());
-                if (pair_count == 0)
-                {
-                    continue;
-                }
-
-                JACOBI_CUDA_CHECK(cudaMemcpy(d_pairs.data(),
-                                             round.data(),
-                                             static_cast<std::size_t>(pair_count) * sizeof(int2),
-                                             cudaMemcpyHostToDevice));
-                JACOBI_CUDA_CHECK(cudaMemset(d_any_rotation.data(), 0, sizeof(int)));
-
-                const std::size_t shared_bytes_stats = static_cast<std::size_t>(threads) * 3 * sizeof(double);
-                pair_stats_kernel<<<pair_count, threads, shared_bytes_stats>>>(d_a.data(),
-                                                                               m,
-                                                                               n,
-                                                                               d_pairs.data(),
-                                                                               pair_count,
-                                                                               d_app.data(),
-                                                                               d_aqq.data(),
-                                                                               d_apq.data());
-                JACOBI_CUDA_CHECK(cudaGetLastError());
-
-                const int rotation_blocks = (pair_count + threads - 1) / threads;
-                compute_rotation_params_kernel<<<rotation_blocks, threads>>>(d_app.data(),
-                                                                             d_aqq.data(),
-                                                                             d_apq.data(),
-                                                                             pair_count,
-                                                                             config.epsilon,
-                                                                             d_c.data(),
-                                                                             d_s.data(),
-                                                                             d_any_rotation.data());
-                JACOBI_CUDA_CHECK(cudaGetLastError());
-
-                apply_rotation_kernel<<<pair_count, threads>>>(d_a.data(),
-                                                               d_v.data(),
-                                                               m,
-                                                               n,
-                                                               d_pairs.data(),
-                                                               pair_count,
-                                                               d_c.data(),
-                                                               d_s.data());
-                JACOBI_CUDA_CHECK(cudaGetLastError());
-
-                int any_rotation = 0;
-                JACOBI_CUDA_CHECK(cudaMemcpy(&any_rotation, d_any_rotation.data(), sizeof(int), cudaMemcpyDeviceToHost));
-                if (any_rotation != 0)
-                {
-                    converged_this_sweep = false;
-                }
-            }
-
-            executed_sweeps = sweep + 1;
-            if (converged_this_sweep)
-            {
-                break;
+                report.recommended_min_columns = columns;
+                report.recommended_min_elements = matrix_element_count(rows, cols);
+                threshold_selected = true;
             }
         }
 
-        const std::size_t shared_bytes_norm = static_cast<std::size_t>(threads) * sizeof(double);
-        build_u_sigma_kernel<<<n, threads, shared_bytes_norm>>>(
-            d_a.data(), d_u.data(), d_sigma.data(), m, n, config.epsilon);
-        JACOBI_CUDA_CHECK(cudaGetLastError());
-        JACOBI_CUDA_CHECK(cudaDeviceSynchronize());
-
-        JacobiSvdResult result;
-        result.rows = rows;
-        result.columns = columns;
-        result.sweeps = executed_sweeps;
-        result.u = d_u.copy_to_host();
-        result.sigma = d_sigma.copy_to_host();
-        result.v = d_v.copy_to_host();
-        return result;
+        return report;
     }
 } // namespace jacobi::svd
 

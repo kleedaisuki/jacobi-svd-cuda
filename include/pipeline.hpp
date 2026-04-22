@@ -83,6 +83,31 @@ namespace jacobi::svd::pipeline
          * @brief 全部测试用例 sweep 总和；Total sweeps across all testcases.
          */
         std::size_t total_sweeps = 0;
+
+        /**
+         * @brief 运行时布局转置策略；Runtime layout-transpose policy.
+         */
+        LayoutTransposeMode layout_transpose_mode = LayoutTransposeMode::auto_select;
+
+        /**
+         * @brief 运行时布局转置最小列数阈值；Runtime minimum-column threshold for layout transpose.
+         */
+        int layout_transpose_min_columns = 16;
+
+        /**
+         * @brief 运行时布局转置最小元素阈值；Runtime minimum-element threshold for layout transpose.
+         */
+        std::size_t layout_transpose_min_elements = 4096;
+
+        /**
+         * @brief 本次是否执行了阈值自动调优；Whether threshold auto-tuning was executed in this run.
+         */
+        bool layout_transpose_auto_tuned = false;
+
+        /**
+         * @brief 自动调优估计最优点加速比；Estimated best-point speedup from auto-tuning.
+         */
+        double layout_transpose_estimated_best_speedup = 1.0;
     };
 
     /**
@@ -119,4 +144,3 @@ namespace jacobi::svd::pipeline
      */
     [[nodiscard]] PipelineReport run_pipeline(const PipelineConfig &config);
 } // namespace jacobi::svd::pipeline
-

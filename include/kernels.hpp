@@ -8,6 +8,58 @@
 namespace jacobi::svd
 {
     /**
+     * @brief 布局转置策略；Layout-transpose policy.
+     */
+    enum class LayoutTransposeMode
+    {
+        /**
+         * @brief 自动按阈值启用；Enable automatically by thresholds.
+         */
+        auto_select,
+
+        /**
+         * @brief 强制启用布局转置；Force-enable layout transpose.
+         */
+        force_enable,
+
+        /**
+         * @brief 强制禁用布局转置；Force-disable layout transpose.
+         */
+        force_disable
+    };
+
+    /**
+     * @brief 布局转置阈值自动调优报告；Auto-tuning report for layout-transpose thresholds.
+     */
+    struct LayoutTransposeAutoTuneReport final
+    {
+        /**
+         * @brief 是否执行过基准扫描；Whether benchmark scan has been executed.
+         */
+        bool executed = false;
+
+        /**
+         * @brief 推荐最小列数阈值；Recommended minimum-column threshold.
+         */
+        int recommended_min_columns = 16;
+
+        /**
+         * @brief 推荐最小元素数阈值；Recommended minimum-element threshold.
+         */
+        std::size_t recommended_min_elements = 4096;
+
+        /**
+         * @brief 估计最优点加速比（direct/transpose）；Estimated best-point speedup ratio (direct/transpose).
+         */
+        double estimated_best_speedup = 1.0;
+
+        /**
+         * @brief 样本扫描数量；Number of scanned samples.
+         */
+        std::size_t sample_count = 0;
+    };
+
+    /**
      * @brief CUDA 运行时错误封装；CUDA runtime error wrapper.
      */
     class CudaError final : public std::runtime_error
@@ -39,6 +91,36 @@ namespace jacobi::svd
          * @brief 每个 CUDA block 的线程数；Threads per CUDA block.
          */
         int threads_per_block = 256;
+
+        /**
+         * @brief 布局转置策略；Layout-transpose policy.
+         */
+        LayoutTransposeMode layout_transpose_mode = LayoutTransposeMode::auto_select;
+
+        /**
+         * @brief 自动策略下最小列数阈值；Minimum column threshold when mode is auto.
+         */
+        int layout_transpose_min_columns = 16;
+
+        /**
+         * @brief 自动策略下最小元素数阈值；Minimum element threshold when mode is auto.
+         */
+        std::size_t layout_transpose_min_elements = 4096;
+
+        /**
+         * @brief 是否在运行前执行阈值微基准自动调优；Whether to run micro-benchmark auto-tuning before execution.
+         */
+        bool layout_transpose_auto_tune = false;
+
+        /**
+         * @brief 自动调优时每个尺寸的重复次数；Repetition count per size during auto-tuning.
+         */
+        int layout_transpose_benchmark_repetitions = 2;
+
+        /**
+         * @brief 自动调优时的基准 sweep 上限；Benchmark sweep cap during auto-tuning.
+         */
+        int layout_transpose_benchmark_sweeps = 8;
     };
 
     /**
@@ -214,4 +296,13 @@ namespace jacobi::svd
                                                        std::size_t rows,
                                                        std::size_t columns,
                                                        const JacobiSvdConfig &config = {});
+
+    /**
+     * @brief 自动扫描矩阵尺寸并给出布局转置阈值建议；Scan matrix sizes and recommend layout-transpose thresholds.
+     * @param config 基准配置模板；Template configuration for benchmark.
+     * @return 阈值自动调优报告；Threshold auto-tuning report.
+     * @note 该函数在领域层执行微基准，不修改全局状态；This function runs micro-benchmark in domain layer without mutating global state.
+     */
+    [[nodiscard]] LayoutTransposeAutoTuneReport auto_tune_layout_transpose_threshold(
+        const JacobiSvdConfig &config = {});
 } // namespace jacobi::svd
