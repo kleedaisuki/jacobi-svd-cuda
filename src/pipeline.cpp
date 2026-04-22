@@ -3,19 +3,26 @@
 #include "io.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <exception>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace jacobi::svd::pipeline
 {
@@ -109,7 +116,7 @@ namespace jacobi::svd::pipeline
         }
 
         /**
-         * @brief 输出数据包（单个 testcase 的 U/Sigma/V）；Output packet containing U/Sigma/V of one testcase.
+         * @brief 输出数据包（单个 testcase 的 U/Sigma/V）；Output packet for one testcase (U/Sigma/V).
          */
         struct OutputPacket final
         {
@@ -119,7 +126,7 @@ namespace jacobi::svd::pipeline
             std::size_t testcase_index = 0;
 
             /**
-             * @brief 当前用例 sweep 次数；Sweep count of this testcase.
+             * @brief 当前用例 sweep 次数；Sweep count for this testcase.
              */
             int sweeps = 0;
 
@@ -140,127 +147,7 @@ namespace jacobi::svd::pipeline
         };
 
         /**
-         * @brief 测试用例输入阶段；Input stage for testcase stream.
-         */
-        class TestcaseSource final
-        {
-        public:
-            /**
-             * @brief 构造输入阶段对象；Construct input-stage object.
-             * @param input_path 输入路径；Input path.
-             * @param format 输入格式；Input format.
-             */
-            TestcaseSource(const std::filesystem::path &input_path, MatrixFileFormat format)
-                : stream_(build_stream(input_path, format))
-            {
-            }
-
-            /**
-             * @brief 读取下一张测试矩阵；Read next testcase matrix.
-             * @param matrix 输出矩阵；Output matrix.
-             * @return 成功返回 true；Returns true on success.
-             */
-            bool read_next(io::Matrix &matrix)
-            {
-                return std::visit([&matrix](auto &stream) {
-                    return stream.read_one(matrix);
-                },
-                                  stream_);
-            }
-
-        private:
-            /**
-             * @brief 输入流变体类型；Input stream variant type.
-             */
-            using InputStreamVariant = std::variant<io::MatInputStream, io::TxtInputStream>;
-
-            /**
-             * @brief 构造输入流；Build input stream.
-             * @param input_path 输入路径；Input path.
-             * @param format 输入格式；Input format.
-             * @return 输入流变体；Input stream variant.
-             */
-            [[nodiscard]] static InputStreamVariant build_stream(const std::filesystem::path &input_path,
-                                                                 MatrixFileFormat format)
-            {
-                if (format == MatrixFileFormat::mat)
-                {
-                    return io::MatInputStream(input_path);
-                }
-                if (format == MatrixFileFormat::txt)
-                {
-                    return io::TxtInputStream(input_path);
-                }
-
-                throw std::invalid_argument("Unsupported testcase input format.");
-            }
-
-            /**
-             * @brief 输入流实例；Input stream instance.
-             */
-            InputStreamVariant stream_;
-        };
-
-        /**
-         * @brief 核函数执行阶段；Kernel execution stage.
-         */
-        class KernelStage final
-        {
-        public:
-            /**
-             * @brief 构造核函数阶段对象；Construct kernel-stage object.
-             * @param config 核函数配置；Kernel configuration.
-             */
-            explicit KernelStage(JacobiSvdConfig config)
-                : config_(config)
-            {
-            }
-
-            /**
-             * @brief 执行一次 testcase 的 SVD；Run one testcase SVD.
-             * @param testcase 输入矩阵；Input matrix.
-             * @param testcase_index 测试用例索引；Testcase index.
-             * @return 输出数据包；Output packet.
-             */
-            [[nodiscard]] OutputPacket execute(const io::Matrix &testcase, std::size_t testcase_index) const
-            {
-                validate_testcase_matrix(testcase, testcase_index);
-
-                JacobiSvdResult result = one_sided_jacobi_svd(testcase.values,
-                                                              testcase.rows,
-                                                              testcase.columns,
-                                                              config_);
-
-                OutputPacket packet;
-                packet.testcase_index = testcase_index;
-                packet.sweeps = result.sweeps;
-                packet.u = io::Matrix{
-                    .rows = result.rows,
-                    .columns = result.columns,
-                    .values = std::move(result.u),
-                };
-                packet.sigma = io::Matrix{
-                    .rows = 1,
-                    .columns = result.columns,
-                    .values = std::move(result.sigma),
-                };
-                packet.v = io::Matrix{
-                    .rows = result.columns,
-                    .columns = result.columns,
-                    .values = std::move(result.v),
-                };
-                return packet;
-            }
-
-        private:
-            /**
-             * @brief 核函数配置；Kernel configuration.
-             */
-            JacobiSvdConfig config_{};
-        };
-
-        /**
-         * @brief 结果写出器（单线程消费者）；Result writer (single consumer thread).
+         * @brief 结果写出器（单线程）；Result writer (single thread).
          */
         class ResultWriter final
         {
@@ -276,7 +163,7 @@ namespace jacobi::svd::pipeline
             }
 
             /**
-             * @brief 写出一条输出数据包；Write one output packet.
+             * @brief 写出一个数据包；Write one output packet.
              * @param packet 输出数据包；Output packet.
              */
             void write_packet(const OutputPacket &packet)
@@ -287,7 +174,7 @@ namespace jacobi::svd::pipeline
             }
 
             /**
-             * @brief 刷新输出流；Flush output stream.
+             * @brief 刷新输出；Flush output stream.
              */
             void flush()
             {
@@ -343,30 +230,192 @@ namespace jacobi::svd::pipeline
         };
 
         /**
-         * @brief 异步输出阶段（生产者-消费者）；Asynchronous output stage (producer-consumer).
-         * @note 生产者在主线程执行 kernel，消费者线程负责落盘；Producer runs kernels on main thread while consumer thread persists results.
+         * @brief 全局线程池（Thread Pool）实现；Implementation of global thread pool.
          */
-        class AsyncOutputStage final
+        class GlobalThreadPool final
         {
         public:
             /**
-             * @brief 构造异步输出阶段；Construct asynchronous output stage.
+             * @brief 构造线程池；Construct thread pool.
+             * @param worker_count 工作线程数；Worker thread count.
+             */
+            explicit GlobalThreadPool(std::size_t worker_count)
+                : worker_count_(std::max<std::size_t>(worker_count, 1))
+            {
+                workers_.reserve(worker_count_);
+                for (std::size_t index = 0; index < worker_count_; ++index)
+                {
+                    workers_.emplace_back([this] {
+                        worker_main();
+                    });
+                }
+            }
+
+            /**
+             * @brief 析构线程池；Destroy thread pool.
+             */
+            ~GlobalThreadPool()
+            {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    stopping_ = true;
+                }
+                consumer_cv_.notify_all();
+
+                for (std::thread &worker : workers_)
+                {
+                    if (worker.joinable())
+                    {
+                        worker.join();
+                    }
+                }
+            }
+
+            /**
+             * @brief 禁止拷贝构造；Copy constructor is disabled.
+             */
+            GlobalThreadPool(const GlobalThreadPool &) = delete;
+
+            /**
+             * @brief 禁止拷贝赋值；Copy assignment is disabled.
+             * @return 当前对象引用；Reference to current object.
+             */
+            GlobalThreadPool &operator=(const GlobalThreadPool &) = delete;
+
+            /**
+             * @brief 提交任务并返回 future；Submit task and return future.
+             * @tparam Callable 可调用类型；Callable type.
+             * @param callable 任务函数；Task callable.
+             * @return 任务 future；Task future.
+             */
+            template <typename Callable>
+            [[nodiscard]] std::future<void> submit(Callable &&callable)
+            {
+                auto packaged_task = std::make_shared<std::packaged_task<void()>>(std::forward<Callable>(callable));
+                std::future<void> result = packaged_task->get_future();
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (stopping_)
+                    {
+                        throw std::runtime_error("Thread pool is stopping.");
+                    }
+                    queue_.emplace([packaged_task] {
+                        (*packaged_task)();
+                    });
+                }
+
+                consumer_cv_.notify_one();
+                return result;
+            }
+
+        private:
+            /**
+             * @brief 工作线程主循环；Worker-thread main loop.
+             */
+            void worker_main()
+            {
+                for (;;)
+                {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        consumer_cv_.wait(lock, [this] {
+                            return stopping_ || !queue_.empty();
+                        });
+
+                        if (stopping_ && queue_.empty())
+                        {
+                            return;
+                        }
+
+                        task = std::move(queue_.front());
+                        queue_.pop();
+                    }
+
+                    task();
+                }
+            }
+
+            /**
+             * @brief 工作线程数量；Worker thread count.
+             */
+            std::size_t worker_count_ = 1;
+
+            /**
+             * @brief 任务队列；Task queue.
+             */
+            std::queue<std::function<void()>> queue_;
+
+            /**
+             * @brief 互斥锁；Mutex.
+             */
+            std::mutex mutex_;
+
+            /**
+             * @brief 条件变量；Condition variable.
+             */
+            std::condition_variable consumer_cv_;
+
+            /**
+             * @brief 停止标志；Stop flag.
+             */
+            bool stopping_ = false;
+
+            /**
+             * @brief 工作线程集合；Worker thread collection.
+             */
+            std::vector<std::thread> workers_;
+        };
+
+        /**
+         * @brief 获取默认线程池大小；Get default thread-pool size.
+         * @return 工作线程数；Worker thread count.
+         */
+        [[nodiscard]] std::size_t default_thread_pool_size()
+        {
+            const unsigned int hardware = std::thread::hardware_concurrency();
+            if (hardware == 0U)
+            {
+                return 4;
+            }
+            return static_cast<std::size_t>(std::max(1U, hardware));
+        }
+
+        /**
+         * @brief 全局惰性线程池访问器；Accessor for global lazy-initialized thread pool.
+         * @return 全局线程池引用；Reference to global thread pool.
+         */
+        [[nodiscard]] GlobalThreadPool &global_thread_pool()
+        {
+            static GlobalThreadPool pool(default_thread_pool_size());
+            return pool;
+        }
+
+        /**
+         * @brief 带重排序缓冲区的异步写出阶段；Asynchronous output stage with reorder buffer.
+         */
+        class ReorderBufferOutputStage final
+        {
+        public:
+            /**
+             * @brief 构造异步写出阶段；Construct asynchronous output stage.
              * @param output_path 输出路径；Output path.
              * @param format 输出格式；Output format.
-             * @param queue_capacity 队列容量；Queue capacity.
+             * @param queue_capacity 完成队列容量；Completion queue capacity.
              */
-            AsyncOutputStage(const std::filesystem::path &output_path,
-                             MatrixFileFormat format,
-                             std::size_t queue_capacity)
+            ReorderBufferOutputStage(const std::filesystem::path &output_path,
+                                     MatrixFileFormat format,
+                                     std::size_t queue_capacity)
                 : queue_capacity_(std::max<std::size_t>(queue_capacity, 1)),
-                  consumer_thread_(&AsyncOutputStage::consumer_main, this, output_path, format)
+                  consumer_thread_(&ReorderBufferOutputStage::consumer_main, this, output_path, format)
             {
             }
 
             /**
-             * @brief 析构时安全关闭线程；Safely close thread on destruction.
+             * @brief 析构并安全关闭；Destroy and safely close.
              */
-            ~AsyncOutputStage()
+            ~ReorderBufferOutputStage()
             {
                 close_noexcept();
             }
@@ -374,60 +423,79 @@ namespace jacobi::svd::pipeline
             /**
              * @brief 禁止拷贝构造；Copy construction is disabled.
              */
-            AsyncOutputStage(const AsyncOutputStage &) = delete;
+            ReorderBufferOutputStage(const ReorderBufferOutputStage &) = delete;
 
             /**
              * @brief 禁止拷贝赋值；Copy assignment is disabled.
              * @return 当前对象引用；Reference to current object.
              */
-            AsyncOutputStage &operator=(const AsyncOutputStage &) = delete;
+            ReorderBufferOutputStage &operator=(const ReorderBufferOutputStage &) = delete;
 
             /**
-             * @brief 提交输出数据包；Submit one output packet.
-             * @param packet 输出数据包；Output packet.
+             * @brief 提交已完成数据包；Submit one completed packet.
+             * @param packet 已完成数据包；Completed output packet.
              */
             void submit(OutputPacket packet)
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 producer_cv_.wait(lock, [this] {
-                    return queue_.size() < queue_capacity_ || closed_ || worker_error_ != nullptr;
+                    return completed_queue_.size() < queue_capacity_ || closed_ || worker_error_ != nullptr;
                 });
                 rethrow_worker_error_locked();
+
                 if (closed_)
                 {
                     throw std::runtime_error("Output stage is closed.");
                 }
-                queue_.push(std::move(packet));
+
+                completed_queue_.push(std::move(packet));
                 consumer_cv_.notify_one();
             }
 
             /**
-             * @brief 关闭输出阶段并等待线程结束；Close output stage and wait for thread termination.
+             * @brief 正常关闭；Close stage in success path.
+             * @param expected_count 期望数据包数量；Expected packet count.
              */
-            void close()
+            void close_success(std::size_t expected_count)
             {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    expected_count_ = expected_count;
                     closed_ = true;
                 }
-
                 consumer_cv_.notify_all();
                 producer_cv_.notify_all();
+                join_and_rethrow();
 
-                if (consumer_thread_.joinable())
+                if (written_count_ != expected_count_)
                 {
-                    consumer_thread_.join();
+                    throw std::runtime_error("Output reorder stage finished with missing packets.");
                 }
+            }
 
-                if (worker_error_ != nullptr)
+            /**
+             * @brief 异常关闭；Close stage in error path.
+             * @param error 异常对象；Exception object.
+             */
+            void close_error(std::exception_ptr error)
+            {
                 {
-                    std::rethrow_exception(worker_error_);
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (worker_error_ == nullptr)
+                    {
+                        worker_error_ = error;
+                    }
+                    closed_ = true;
+                    abort_ = true;
                 }
+                consumer_cv_.notify_all();
+                producer_cv_.notify_all();
+                join_and_rethrow();
             }
 
         private:
             /**
-             * @brief 消费者主循环；Consumer main loop.
+             * @brief 写线程主循环；Writer-thread main loop.
              * @param output_path 输出路径；Output path.
              * @param format 输出格式；Output format.
              */
@@ -441,24 +509,42 @@ namespace jacobi::svd::pipeline
                     for (;;)
                     {
                         OutputPacket packet;
+                        bool has_packet = false;
+
                         {
                             std::unique_lock<std::mutex> lock(mutex_);
                             consumer_cv_.wait(lock, [this] {
-                                return !queue_.empty() || closed_;
+                                return !completed_queue_.empty() || closed_ || abort_;
                             });
 
-                            if (queue_.empty())
+                            if (!completed_queue_.empty())
+                            {
+                                packet = std::move(completed_queue_.front());
+                                completed_queue_.pop();
+                                has_packet = true;
+                                producer_cv_.notify_one();
+                            }
+                            else if (closed_ || abort_)
                             {
                                 break;
                             }
-
-                            packet = std::move(queue_.front());
-                            queue_.pop();
-                            producer_cv_.notify_one();
                         }
-                        writer.write_packet(packet);
+
+                        if (!has_packet)
+                        {
+                            continue;
+                        }
+
+                        auto [iterator, inserted] = reorder_buffer_.emplace(packet.testcase_index, std::move(packet));
+                        if (!inserted)
+                        {
+                            throw std::runtime_error("Duplicate testcase index in reorder buffer.");
+                        }
+
+                        flush_ready_packets(writer);
                     }
 
+                    flush_ready_packets(writer);
                     writer.flush();
                 }
                 catch (...)
@@ -469,13 +555,51 @@ namespace jacobi::svd::pipeline
                         worker_error_ = std::current_exception();
                     }
                     closed_ = true;
+                    abort_ = true;
                     producer_cv_.notify_all();
                     consumer_cv_.notify_all();
                 }
             }
 
             /**
-             * @brief 在锁内抛出消费者异常；Rethrow consumer exception while lock is held.
+             * @brief 尝试按序写出连续数据包；Flush contiguous packets in order.
+             * @param writer 结果写出器；Result writer.
+             */
+            void flush_ready_packets(ResultWriter &writer)
+            {
+                for (;;)
+                {
+                    const auto iterator = reorder_buffer_.find(next_expected_index_);
+                    if (iterator == reorder_buffer_.end())
+                    {
+                        break;
+                    }
+
+                    writer.write_packet(iterator->second);
+                    reorder_buffer_.erase(iterator);
+                    ++next_expected_index_;
+                    ++written_count_;
+                }
+            }
+
+            /**
+             * @brief 连接写线程并抛出异常；Join writer thread and rethrow error if any.
+             */
+            void join_and_rethrow()
+            {
+                if (consumer_thread_.joinable())
+                {
+                    consumer_thread_.join();
+                }
+
+                if (worker_error_ != nullptr)
+                {
+                    std::rethrow_exception(worker_error_);
+                }
+            }
+
+            /**
+             * @brief 在锁内抛出写线程异常；Rethrow writer-thread exception while lock is held.
              */
             void rethrow_worker_error_locked() const
             {
@@ -486,13 +610,13 @@ namespace jacobi::svd::pipeline
             }
 
             /**
-             * @brief noexcept 关闭辅助函数；noexcept close helper.
+             * @brief noexcept 关闭助手；Noexcept close helper.
              */
             void close_noexcept() noexcept
             {
                 try
                 {
-                    close();
+                    close_error(std::make_exception_ptr(std::runtime_error("Output stage closed by destructor.")));
                 }
                 catch (...)
                 {
@@ -500,14 +624,34 @@ namespace jacobi::svd::pipeline
             }
 
             /**
-             * @brief 队列容量；Queue capacity.
+             * @brief 完成队列容量；Completion queue capacity.
              */
             std::size_t queue_capacity_ = 1;
 
             /**
-             * @brief 生产者-消费者队列；Producer-consumer queue.
+             * @brief 完成数据包队列；Completed packet queue.
              */
-            std::queue<OutputPacket> queue_;
+            std::queue<OutputPacket> completed_queue_;
+
+            /**
+             * @brief 重排序缓冲区；Reorder buffer.
+             */
+            std::unordered_map<std::size_t, OutputPacket> reorder_buffer_;
+
+            /**
+             * @brief 下一个期望索引；Next expected testcase index.
+             */
+            std::size_t next_expected_index_ = 0;
+
+            /**
+             * @brief 期望总包数；Expected packet count.
+             */
+            std::size_t expected_count_ = 0;
+
+            /**
+             * @brief 已写包数；Written packet count.
+             */
+            std::size_t written_count_ = 0;
 
             /**
              * @brief 互斥锁；Mutex.
@@ -525,19 +669,114 @@ namespace jacobi::svd::pipeline
             std::condition_variable producer_cv_;
 
             /**
-             * @brief 是否已请求关闭；Whether close is requested.
+             * @brief 关闭标记；Close flag.
              */
             bool closed_ = false;
 
             /**
-             * @brief 消费者线程异常；Consumer thread exception.
+             * @brief 中止标记；Abort flag.
+             */
+            bool abort_ = false;
+
+            /**
+             * @brief 写线程异常；Writer-thread exception.
              */
             std::exception_ptr worker_error_;
 
             /**
-             * @brief 消费者线程；Consumer thread.
+             * @brief 消费线程；Consumer thread.
              */
             std::thread consumer_thread_;
+        };
+
+        /**
+         * @brief 文本输入读取阶段；Text input stage.
+         */
+        class TextTestcaseSource final
+        {
+        public:
+            /**
+             * @brief 构造文本输入阶段；Construct text input stage.
+             * @param input_path 输入路径；Input path.
+             */
+            explicit TextTestcaseSource(const std::filesystem::path &input_path)
+                : stream_(io::TxtInputStream(input_path))
+            {
+            }
+
+            /**
+             * @brief 读取下一张矩阵；Read next matrix.
+             * @param matrix 输出矩阵；Output matrix.
+             * @return 读取成功返回 true，EOF 返回 false；Returns true on success, false on EOF.
+             */
+            bool read_next(io::Matrix &matrix)
+            {
+                return stream_.read_one(matrix);
+            }
+
+        private:
+            /**
+             * @brief 文本输入流；Text input stream.
+             */
+            io::TxtInputStream stream_;
+        };
+
+        /**
+         * @brief 核函数执行阶段；Kernel execution stage.
+         */
+        class KernelStage final
+        {
+        public:
+            /**
+             * @brief 构造核函数阶段；Construct kernel stage.
+             * @param config 核函数配置；Kernel configuration.
+             */
+            explicit KernelStage(JacobiSvdConfig config)
+                : config_(config)
+            {
+            }
+
+            /**
+             * @brief 执行一次 testcase 的 SVD；Execute SVD for one testcase.
+             * @param testcase 输入矩阵；Input matrix.
+             * @param testcase_index 测试用例索引；Testcase index.
+             * @return 输出数据包；Output packet.
+             */
+            [[nodiscard]] OutputPacket execute(const io::Matrix &testcase, std::size_t testcase_index) const
+            {
+                validate_testcase_matrix(testcase, testcase_index);
+
+                JacobiSvdResult result = one_sided_jacobi_svd(testcase.values,
+                                                              testcase.rows,
+                                                              testcase.columns,
+                                                              config_);
+
+                OutputPacket packet;
+                packet.testcase_index = testcase_index;
+                packet.sweeps = result.sweeps;
+                packet.u = io::Matrix{
+                    .rows = result.rows,
+                    .columns = result.columns,
+                    .values = std::move(result.u),
+                };
+                packet.sigma = io::Matrix{
+                    .rows = 1,
+                    .columns = result.columns,
+                    .values = std::move(result.sigma),
+                };
+                packet.v = io::Matrix{
+                    .rows = result.columns,
+                    .columns = result.columns,
+                    .values = std::move(result.v),
+                };
+                return packet;
+            }
+
+        private:
+            /**
+             * @brief 核函数配置；Kernel configuration.
+             */
+            JacobiSvdConfig config_{};
         };
     } // namespace
 
@@ -560,26 +799,131 @@ namespace jacobi::svd::pipeline
         const MatrixFileFormat input_format = resolve_file_format(config_.input_format, config_.input_path);
         const MatrixFileFormat output_format = resolve_file_format(config_.output_format, config_.output_path);
 
-        TestcaseSource source(config_.input_path, input_format);
         KernelStage kernel(config_.kernel_config);
-        AsyncOutputStage output(config_.output_path, output_format, config_.max_queued_results);
+        ReorderBufferOutputStage output(config_.output_path, output_format, config_.max_queued_results);
+        GlobalThreadPool &pool = global_thread_pool();
 
-        PipelineReport report;
-        std::size_t testcase_index = 0;
+        std::exception_ptr first_worker_error;
+        std::atomic<std::size_t> total_sweeps{0};
+        std::deque<std::future<void>> inflight;
+        const std::size_t max_inflight = std::max<std::size_t>(config_.max_queued_results, 1);
+        std::size_t submitted_count = 0;
 
-        io::Matrix testcase;
-        while (source.read_next(testcase))
+        auto observe_future = [&first_worker_error](std::future<void> &task_future) {
+            try
+            {
+                task_future.get();
+            }
+            catch (...)
+            {
+                if (first_worker_error == nullptr)
+                {
+                    first_worker_error = std::current_exception();
+                }
+            }
+        };
+
+        auto submit_future = [&](std::future<void> future_task) {
+            inflight.push_back(std::move(future_task));
+            if (inflight.size() >= max_inflight)
+            {
+                observe_future(inflight.front());
+                inflight.pop_front();
+            }
+        };
+
+        try
         {
-            OutputPacket packet = kernel.execute(testcase, testcase_index);
-            report.testcase_count += 1;
-            report.emitted_matrix_count += 3;
-            report.total_sweeps += static_cast<std::size_t>(packet.sweeps);
-            output.submit(std::move(packet));
-            ++testcase_index;
-        }
+            if (input_format == MatrixFileFormat::mat)
+            {
+                io::MatDispatchReader reader(config_.input_path);
+                io::MatDispatchTask dispatch_task;
 
-        output.close();
-        return report;
+                while (reader.read_next(dispatch_task))
+                {
+                    io::MatDispatchTask task_for_worker = std::move(dispatch_task);
+                    dispatch_task = io::MatDispatchTask{};
+
+                    const std::size_t testcase_index = task_for_worker.sequence_index;
+                    submit_future(pool.submit([task = std::move(task_for_worker),
+                                               testcase_index,
+                                               &kernel,
+                                               &output,
+                                               &total_sweeps]() mutable {
+                        io::Matrix testcase = io::decode_dispatch_task_matrix(task);
+                        OutputPacket packet = kernel.execute(testcase, testcase_index);
+                        total_sweeps.fetch_add(static_cast<std::size_t>(packet.sweeps), std::memory_order_relaxed);
+                        output.submit(std::move(packet));
+                    }));
+
+                    submitted_count += 1;
+                    if (first_worker_error != nullptr)
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                TextTestcaseSource source(config_.input_path);
+                io::Matrix testcase;
+                std::size_t testcase_index = 0;
+
+                while (source.read_next(testcase))
+                {
+                    io::Matrix testcase_for_worker = std::move(testcase);
+                    testcase = io::Matrix{};
+
+                    submit_future(pool.submit([testcase_data = std::move(testcase_for_worker),
+                                               testcase_index,
+                                               &kernel,
+                                               &output,
+                                               &total_sweeps]() mutable {
+                        OutputPacket packet = kernel.execute(testcase_data, testcase_index);
+                        total_sweeps.fetch_add(static_cast<std::size_t>(packet.sweeps), std::memory_order_relaxed);
+                        output.submit(std::move(packet));
+                    }));
+
+                    submitted_count += 1;
+                    testcase_index += 1;
+                    if (first_worker_error != nullptr)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            while (!inflight.empty())
+            {
+                observe_future(inflight.front());
+                inflight.pop_front();
+            }
+
+            if (first_worker_error != nullptr)
+            {
+                output.close_error(first_worker_error);
+                std::rethrow_exception(first_worker_error);
+            }
+
+            output.close_success(submitted_count);
+
+            PipelineReport report;
+            report.testcase_count = submitted_count;
+            report.emitted_matrix_count = submitted_count * 3;
+            report.total_sweeps = total_sweeps.load(std::memory_order_relaxed);
+            return report;
+        }
+        catch (...)
+        {
+            try
+            {
+                output.close_error(std::current_exception());
+            }
+            catch (...)
+            {
+            }
+            throw;
+        }
     }
 
     PipelineReport run_pipeline(const PipelineConfig &config)
@@ -587,4 +931,3 @@ namespace jacobi::svd::pipeline
         return JacobiSvdPipeline(config).run();
     }
 } // namespace jacobi::svd::pipeline
-

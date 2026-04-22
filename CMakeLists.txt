@@ -11,7 +11,7 @@ option(JACOBI_USE_CMAKE_CUDA_LANGUAGE
 set(JACOBI_SOURCES
     "${CMAKE_SOURCE_DIR}/src/main.cpp"
     "${CMAKE_SOURCE_DIR}/src/pipeline.cpp"
-    "${CMAKE_SOURCE_DIR}/src/io.cpp"
+    "${CMAKE_SOURCE_DIR}/src/io.cu"
     "${CMAKE_SOURCE_DIR}/src/kernels.cu"
 )
 

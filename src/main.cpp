@@ -1,11 +1,13 @@
 #include "pipeline.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -101,9 +103,19 @@ namespace jacobi::svd::cli
         std::size_t queue_capacity = 4;
 
         /**
+         * @brief 鏄惁寮哄埗瑕嗙洊宸叉湁杈撳嚭锛沇hether to force overwriting existing output.
+         */
+        bool force_overwrite = false;
+
+        /**
          * @brief 仅展示配置，不执行；Print configuration only without execution.
          */
         bool dry_run = false;
+
+        /**
+         * @brief 鏄惁杈撳嚭鐢熸晥閰嶇疆锛沇hether to print effective configuration before execution.
+         */
+        bool print_config = false;
 
         /**
          * @brief 是否输出 JSON 报告；Whether to emit JSON report.
@@ -183,9 +195,19 @@ namespace jacobi::svd::cli
         queue_capacity,
 
         /**
+         * @brief force 閫夐」锛沠orce-overwrite option.
+         */
+        force,
+
+        /**
          * @brief dry-run 选项；dry-run option.
          */
         dry_run,
+
+        /**
+         * @brief print-config 閫夐」锛沜rint-config option.
+         */
+        print_config,
 
         /**
          * @brief JSON 报告选项；JSON-report option.
@@ -406,6 +428,40 @@ namespace jacobi::svd::cli
     }
 
     /**
+     * @brief 由文件扩展名推断矩阵格式；Infer matrix format from file extension.
+     * @param path 文件路径；File path.
+     * @return 若可识别返回格式，否则返回空；Returns format when recognized, otherwise empty.
+     */
+    [[nodiscard]] std::optional<pipeline::MatrixFileFormat> detect_matrix_format_from_extension(
+        const std::filesystem::path &path)
+    {
+        const std::string lowered = to_lower_ascii(path.extension().string());
+        if (lowered == ".mat")
+        {
+            return pipeline::MatrixFileFormat::mat;
+        }
+        if (lowered == ".txt")
+        {
+            return pipeline::MatrixFileFormat::txt;
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief 获取格式对应默认扩展名；Get canonical extension of one format.
+     * @param format 目标格式；Target format.
+     * @return 扩展名字符串；File extension string.
+     */
+    [[nodiscard]] std::string canonical_extension_for_format(pipeline::MatrixFileFormat format)
+    {
+        if (format == pipeline::MatrixFileFormat::txt)
+        {
+            return ".txt";
+        }
+        return ".mat";
+    }
+
+    /**
      * @brief 解析正整数；Parse positive integer.
      * @param raw 文本值；Raw value text.
      * @param option_name 选项名；Option name.
@@ -515,23 +571,91 @@ namespace jacobi::svd::cli
     }
 
     /**
-     * @brief 校验运行选项；Validate run-time options.
-     * @param options CLI 选项；CLI options.
+     * @brief 规范化运行选项；Normalize run-time options.
+     * @param options CLI 选项（原地修改）；CLI options (modified in-place).
      */
-    void validate_run_options(const CliOptions &options)
+    void normalize_run_options(CliOptions &options)
     {
         if (options.input_path.empty())
         {
             throw CliArgumentError("Missing input file. Use --input <path>.");
         }
-        if (options.output_path.empty())
+
+        const std::optional<pipeline::MatrixFileFormat> input_ext_format =
+            detect_matrix_format_from_extension(options.input_path);
+        if (options.input_format == pipeline::MatrixFileFormat::auto_detect && !input_ext_format.has_value())
         {
-            throw CliArgumentError("Missing output file. Use --output <path>.");
+            throw CliArgumentError("Cannot infer input format from extension. Use --input-format {mat|txt}.");
         }
 
+        if (options.output_path.empty())
+        {
+            pipeline::MatrixFileFormat output_format = options.output_format;
+            if (output_format == pipeline::MatrixFileFormat::auto_detect)
+            {
+                if (options.input_format != pipeline::MatrixFileFormat::auto_detect)
+                {
+                    output_format = options.input_format;
+                }
+                else if (input_ext_format.has_value())
+                {
+                    output_format = input_ext_format.value();
+                }
+                else
+                {
+                    output_format = pipeline::MatrixFileFormat::mat;
+                }
+                options.output_format = output_format;
+            }
+
+            std::string stem = options.input_path.stem().string();
+            if (stem.empty())
+            {
+                stem = "result";
+            }
+            options.output_path = options.input_path.parent_path() /
+                                  (stem + ".svd" + canonical_extension_for_format(output_format));
+        }
+
+        const std::optional<pipeline::MatrixFileFormat> output_ext_format =
+            detect_matrix_format_from_extension(options.output_path);
+        if (options.output_format == pipeline::MatrixFileFormat::auto_detect && !output_ext_format.has_value())
+        {
+            pipeline::MatrixFileFormat fallback = pipeline::MatrixFileFormat::mat;
+            if (options.input_format != pipeline::MatrixFileFormat::auto_detect)
+            {
+                fallback = options.input_format;
+            }
+            else if (input_ext_format.has_value())
+            {
+                fallback = input_ext_format.value();
+            }
+
+            if (options.output_path.extension().empty())
+            {
+                options.output_path += canonical_extension_for_format(fallback);
+            }
+            options.output_format = fallback;
+        }
+    }
+
+    /**
+     * @brief 校验运行选项；Validate run-time options.
+     * @param options CLI 选项；CLI options.
+     */
+    void validate_run_options(const CliOptions &options)
+    {
         if (!std::filesystem::exists(options.input_path))
         {
             throw CliArgumentError("Input file does not exist: " + options.input_path.string());
+        }
+        if (std::filesystem::is_directory(options.input_path))
+        {
+            throw CliArgumentError("Input path is a directory, expected a file: " + options.input_path.string());
+        }
+        if (std::filesystem::is_directory(options.output_path))
+        {
+            throw CliArgumentError("Output path points to a directory: " + options.output_path.string());
         }
 
         const std::filesystem::path lhs = normalized_path_for_compare(options.input_path);
@@ -539,6 +663,12 @@ namespace jacobi::svd::cli
         if (lhs == rhs)
         {
             throw CliArgumentError("Input and output paths must be different files.");
+        }
+
+        if (std::filesystem::exists(options.output_path) && !options.force_overwrite)
+        {
+            throw CliArgumentError("Output file already exists. Use --force to overwrite: " +
+                                   options.output_path.string());
         }
     }
 
@@ -567,9 +697,12 @@ namespace jacobi::svd::cli
      * @brief 输出 dry-run 配置摘要；Print dry-run configuration summary.
      * @param options CLI 选项；CLI options.
      */
-    void print_dry_run_config(const CliOptions &options)
+    void print_dry_run_config(const CliOptions &options, bool include_dry_run_banner)
     {
-        std::cout << "Dry run: pipeline was not executed.\n";
+        if (include_dry_run_banner)
+        {
+            std::cout << "Dry run: pipeline was not executed.\n";
+        }
         std::cout << "input           : " << options.input_path.string() << '\n';
         std::cout << "output          : " << options.output_path.string() << '\n';
         std::cout << "input-format    : " << matrix_format_to_string(options.input_format) << '\n';
@@ -578,30 +711,35 @@ namespace jacobi::svd::cli
         std::cout << "max-sweeps      : " << options.max_sweeps << '\n';
         std::cout << "threads-per-blk : " << options.threads_per_block << '\n';
         std::cout << "queue-capacity  : " << options.queue_capacity << '\n';
+        std::cout << "force-overwrite : " << (options.force_overwrite ? "true" : "false") << '\n';
     }
 
     /**
      * @brief 输出文本执行报告；Print text execution report.
      * @param report Pipeline 报告；Pipeline report.
      */
-    void print_text_report(const pipeline::PipelineReport &report)
+    void print_text_report(const pipeline::PipelineReport &report, double elapsed_milliseconds)
     {
         std::cout << "Pipeline completed.\n";
         std::cout << "testcases       : " << report.testcase_count << '\n';
         std::cout << "emitted-matrices: " << report.emitted_matrix_count << '\n';
         std::cout << "total-sweeps    : " << report.total_sweeps << '\n';
+        std::cout << "elapsed-ms      : " << std::fixed << std::setprecision(3)
+                  << elapsed_milliseconds << '\n';
     }
 
     /**
      * @brief 输出 JSON 执行报告；Print JSON execution report.
      * @param report Pipeline 报告；Pipeline report.
      */
-    void print_json_report(const pipeline::PipelineReport &report)
+    void print_json_report(const pipeline::PipelineReport &report, double elapsed_milliseconds)
     {
         std::cout << "{\n";
         std::cout << "  \"testcase_count\": " << report.testcase_count << ",\n";
         std::cout << "  \"emitted_matrix_count\": " << report.emitted_matrix_count << ",\n";
-        std::cout << "  \"total_sweeps\": " << report.total_sweeps << '\n';
+        std::cout << "  \"total_sweeps\": " << report.total_sweeps << ",\n";
+        std::cout << "  \"elapsed_ms\": " << std::fixed << std::setprecision(3)
+                  << elapsed_milliseconds << '\n';
         std::cout << "}\n";
     }
 
@@ -615,8 +753,10 @@ namespace jacobi::svd::cli
               {OptionId::epsilon, "epsilon", 'e', true, "NUM", "Convergence epsilon (>0)."},
               {OptionId::max_sweeps, "max-sweeps", 's', true, "N", "Maximum sweep count (>0)."},
               {OptionId::threads_per_block, "threads-per-block", 't', true, "N", "CUDA threads per block (>0)."},
-              {OptionId::queue_capacity, "queue-capacity", 'c', true, "N", "Result queue capacity (>0)."},
+              {OptionId::queue_capacity, "queue-capacity", 'c', true, "N", "In-flight/reorder window size (>0)."},
+              {OptionId::force, "force", 'y', false, "", "Overwrite existing output file."},
               {OptionId::dry_run, "dry-run", '\0', false, "", "Validate arguments and print config only."},
+              {OptionId::print_config, "print-config", '\0', false, "", "Print effective config before execution."},
               {OptionId::json_report, "json-report", '\0', false, "", "Print execution report in JSON."},
               {OptionId::quiet, "quiet", 'q', false, "", "Suppress text report."},
               {OptionId::help, "help", 'h', false, "", "Show this help message."},
@@ -688,6 +828,7 @@ namespace jacobi::svd::cli
 
         if (result.action == ParseAction::run)
         {
+            normalize_run_options(result.options);
             validate_run_options(result.options);
         }
 
@@ -699,7 +840,7 @@ namespace jacobi::svd::cli
         std::ostringstream stream;
         stream << "Jacobi SVD CUDA CLI\n\n";
         stream << "Usage:\n";
-        stream << "  " << executable << " [OPTIONS] <input> <output>\n\n";
+        stream << "  " << executable << " [OPTIONS] <input> [output]\n\n";
         stream << "Options:\n";
 
         for (const OptionDefinition &option : definitions_)
@@ -728,8 +869,12 @@ namespace jacobi::svd::cli
 
         stream << "\nExamples:\n";
         stream << "  " << executable << " -i experiments/inputs/a.mat -o experiments/outputs/r.mat\n";
+        stream << "  " << executable << " experiments/inputs/a.mat --print-config\n";
         stream << "  " << executable << " input.txt output.txt --format txt --epsilon 1e-10\n";
-        stream << "  " << executable << " --input a.mat --output b.txt --output-format txt --json-report\n";
+        stream << "  " << executable << " --input a.mat --output b.txt --output-format txt --json-report --force\n";
+        stream << "\nNotes:\n";
+        stream << "  - When [output] is omitted, default output is <input-stem>.svd.{mat|txt}.\n";
+        stream << "  - Existing output file requires --force to overwrite.\n";
         return stream.str();
     }
 
@@ -851,8 +996,14 @@ namespace jacobi::svd::cli
         case OptionId::queue_capacity:
             result.options.queue_capacity = parse_positive_size(value.value(), option.long_name);
             return;
+        case OptionId::force:
+            result.options.force_overwrite = true;
+            return;
         case OptionId::dry_run:
             result.options.dry_run = true;
+            return;
+        case OptionId::print_config:
+            result.options.print_config = true;
             return;
         case OptionId::json_report:
             result.options.json_report = true;
@@ -942,21 +1093,32 @@ int main(int argc, char *argv[])
 
         if (parsed.options.dry_run)
         {
-            jacobi::svd::cli::print_dry_run_config(parsed.options);
+            jacobi::svd::cli::print_dry_run_config(parsed.options, true);
             return 0;
+        }
+
+        if (parsed.options.print_config)
+        {
+            std::cout << "Effective configuration:\n";
+            jacobi::svd::cli::print_dry_run_config(parsed.options, false);
+            std::cout << '\n';
         }
 
         const jacobi::svd::pipeline::PipelineConfig config =
             jacobi::svd::cli::make_pipeline_config(parsed.options);
+        const auto started_at = std::chrono::steady_clock::now();
         const jacobi::svd::pipeline::PipelineReport report = jacobi::svd::pipeline::run_pipeline(config);
+        const auto finished_at = std::chrono::steady_clock::now();
+        const double elapsed_milliseconds =
+            std::chrono::duration<double, std::milli>(finished_at - started_at).count();
 
         if (!parsed.options.quiet)
         {
-            jacobi::svd::cli::print_text_report(report);
+            jacobi::svd::cli::print_text_report(report, elapsed_milliseconds);
         }
         if (parsed.options.json_report)
         {
-            jacobi::svd::cli::print_json_report(report);
+            jacobi::svd::cli::print_json_report(report, elapsed_milliseconds);
         }
 
         return 0;

@@ -4,6 +4,7 @@
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <span>
 #include <utility>
@@ -48,6 +49,196 @@ namespace jacobi::svd::io
          */
         std::uint64_t columns = 0;
     };
+
+    /**
+     * @brief 页锁定主机缓冲区；Pinned host buffer with one contiguous allocation.
+     * @note 该缓冲区通过 cudaMallocHost/cudaFreeHost 管理；This buffer is managed by cudaMallocHost/cudaFreeHost.
+     */
+    class PinnedHostTaskBuffer final
+    {
+    public:
+        /**
+         * @brief 构造空缓冲；Construct an empty buffer.
+         */
+        PinnedHostTaskBuffer() = default;
+
+        /**
+         * @brief 析构并释放缓冲；Destroy and release the buffer.
+         */
+        ~PinnedHostTaskBuffer();
+
+        /**
+         * @brief 禁止拷贝构造；Copy construction is disabled.
+         */
+        PinnedHostTaskBuffer(const PinnedHostTaskBuffer &) = delete;
+
+        /**
+         * @brief 禁止拷贝赋值；Copy assignment is disabled.
+         * @return 当前对象引用；Reference to current object.
+         */
+        PinnedHostTaskBuffer &operator=(const PinnedHostTaskBuffer &) = delete;
+
+        /**
+         * @brief 移动构造；Move constructor.
+         * @param other 源对象；Source object.
+         */
+        PinnedHostTaskBuffer(PinnedHostTaskBuffer &&other) noexcept;
+
+        /**
+         * @brief 移动赋值；Move assignment.
+         * @param other 源对象；Source object.
+         * @return 当前对象引用；Reference to current object.
+         */
+        PinnedHostTaskBuffer &operator=(PinnedHostTaskBuffer &&other) noexcept;
+
+        /**
+         * @brief 预留输入区与工作区；Reserve one block for input and workspace.
+         * @param input_bytes 输入区字节数；Input byte size.
+         * @param workspace_bytes 工作区字节数；Workspace byte size.
+         */
+        void reserve(std::size_t input_bytes, std::size_t workspace_bytes);
+
+        /**
+         * @brief 获取可写输入区；Get mutable input region.
+         * @return 输入区字节视图；Input byte span.
+         */
+        [[nodiscard]] std::span<std::byte> mutable_input_bytes() noexcept;
+
+        /**
+         * @brief 获取只读输入区；Get const input region.
+         * @return 输入区字节视图；Input byte span.
+         */
+        [[nodiscard]] std::span<const std::byte> input_bytes() const noexcept;
+
+        /**
+         * @brief 获取可写工作区；Get mutable workspace region.
+         * @return 工作区字节视图；Workspace byte span.
+         */
+        [[nodiscard]] std::span<std::byte> mutable_workspace_bytes() noexcept;
+
+        /**
+         * @brief 获取只读工作区；Get const workspace region.
+         * @return 工作区字节视图；Workspace byte span.
+         */
+        [[nodiscard]] std::span<const std::byte> workspace_bytes() const noexcept;
+
+        /**
+         * @brief 当前容量（字节）；Current allocated capacity in bytes.
+         * @return 容量；Capacity.
+         */
+        [[nodiscard]] std::size_t capacity_bytes() const noexcept;
+
+        /**
+         * @brief 当前输入区大小（字节）；Current input size in bytes.
+         * @return 输入区大小；Input size.
+         */
+        [[nodiscard]] std::size_t input_size_bytes() const noexcept;
+
+        /**
+         * @brief 当前工作区大小（字节）；Current workspace size in bytes.
+         * @return 工作区大小；Workspace size.
+         */
+        [[nodiscard]] std::size_t workspace_size_bytes() const noexcept;
+
+    private:
+        /**
+         * @brief 释放底层缓冲；Release underlying allocation.
+         */
+        void release() noexcept;
+
+        /**
+         * @brief 从另一个对象移动资源；Move resources from another object.
+         * @param other 源对象；Source object.
+         */
+        void move_from(PinnedHostTaskBuffer &&other) noexcept;
+
+        /**
+         * @brief 输入区起始地址；Input region base address.
+         */
+        std::byte *data_ = nullptr;
+
+        /**
+         * @brief 当前容量（字节）；Current capacity in bytes.
+         */
+        std::size_t capacity_bytes_ = 0;
+
+        /**
+         * @brief 输入区大小（字节）；Input size in bytes.
+         */
+        std::size_t input_size_bytes_ = 0;
+
+        /**
+         * @brief 工作区大小（字节）；Workspace size in bytes.
+         */
+        std::size_t workspace_size_bytes_ = 0;
+    };
+
+    /**
+     * @brief 单次派发任务；One dispatch task for a single *.mat matrix record.
+     * @note 输入区保存原始网络字节序 payload，工作区用于后续解析/计算；Input region stores raw network-order payload, workspace is reserved for later decode/compute.
+     */
+    struct MatDispatchTask final
+    {
+        /**
+         * @brief 派发序号；Dispatch sequence index.
+         */
+        std::size_t sequence_index = 0;
+
+        /**
+         * @brief 矩阵行数；Matrix row count.
+         */
+        std::size_t rows = 0;
+
+        /**
+         * @brief 矩阵列数；Matrix column count.
+         */
+        std::size_t columns = 0;
+
+        /**
+         * @brief 单块页锁定缓冲；Single pinned block containing input+workspace.
+         */
+        PinnedHostTaskBuffer buffer;
+    };
+
+    /**
+     * @brief *.mat 单游标派发读取器；Single-cursor dispatch reader for *.mat.
+     * @note 该类为栈对象设计，不使用 pImpl（pointer to implementation）；This class is stack-allocated and does not use pImpl.
+     */
+    class MatDispatchReader final
+    {
+    public:
+        /**
+         * @brief 通过路径构造派发读取器；Construct dispatch reader from file path.
+         * @param path 输入路径；Input path.
+         */
+        explicit MatDispatchReader(const std::filesystem::path &path);
+
+        /**
+         * @brief 读取并填充下一条任务；Read and populate next dispatch task.
+         * @param task 输出任务（可移动复用）；Output task (movable and reusable).
+         * @param workspace_bytes 预留工作区字节数；Reserved workspace byte size.
+         * @return 成功读取返回 true，EOF 返回 false；Returns true if one task is read, false on EOF.
+         */
+        [[nodiscard]] bool read_next(MatDispatchTask &task, std::size_t workspace_bytes = 0);
+
+    private:
+        /**
+         * @brief 输入文件流；Input file stream.
+         */
+        std::ifstream input_;
+
+        /**
+         * @brief 下一个派发序号；Next dispatch sequence index.
+         */
+        std::size_t next_sequence_index_ = 0;
+    };
+
+    /**
+     * @brief 将派发任务解析为矩阵；Decode dispatch task payload into Matrix.
+     * @param task 派发任务；Dispatch task.
+     * @return 解码后的矩阵；Decoded matrix.
+     */
+    [[nodiscard]] Matrix decode_dispatch_task_matrix(const MatDispatchTask &task);
 
     /**
      * @brief *.mat 读取器前置声明；Forward declaration of *.mat reader.

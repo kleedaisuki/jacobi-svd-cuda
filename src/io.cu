@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_runtime_api.h>
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -60,6 +62,11 @@ namespace jacobi::svd::io
          * @brief 输出映射最小容量；Minimum mapped capacity for output.
          */
         constexpr std::size_t kMinMappedCapacity = 1U << 20U;
+
+        /**
+         * @brief 任务页锁定缓冲最小容量；Minimum pinned-task buffer capacity.
+         */
+        constexpr std::size_t kMinPinnedTaskCapacity = 64U * 1024U;
 
         /**
          * @brief 检查并计算无符号乘法；Checked multiplication for unsigned sizes.
@@ -211,6 +218,45 @@ namespace jacobi::svd::io
                 throw std::invalid_argument("Invalid numeric token in text matrix row.");
             }
             return row_values;
+        }
+
+        /**
+         * @brief 将 size_t 安全转换为 streamsize；Safely convert size_t to streamsize.
+         * @param bytes 字节数；Byte count.
+         * @return streamsize 数值；Converted streamsize value.
+         */
+        [[nodiscard]] std::streamsize checked_to_streamsize(std::size_t bytes)
+        {
+            if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()))
+            {
+                throw std::overflow_error("Byte size exceeds streamsize range.");
+            }
+            return static_cast<std::streamsize>(bytes);
+        }
+
+        /**
+         * @brief 计算增长后容量；Compute grown capacity.
+         * @param current 当前容量；Current capacity.
+         * @param required 需求容量；Required capacity.
+         * @return 新容量；New capacity.
+         */
+        [[nodiscard]] std::size_t grow_capacity(std::size_t current, std::size_t required)
+        {
+            if (required == 0)
+            {
+                return 0;
+            }
+
+            std::size_t grown = (current == 0) ? kMinPinnedTaskCapacity : current;
+            while (grown < required)
+            {
+                if (grown > (std::numeric_limits<std::size_t>::max() / 2))
+                {
+                    return required;
+                }
+                grown *= 2;
+            }
+            return grown;
         }
 
 #ifdef _WIN32
@@ -944,6 +990,182 @@ namespace jacobi::svd::io
     TxtWriter::TxtWriter(TxtWriter &&other) noexcept = default;
 
     TxtWriter &TxtWriter::operator=(TxtWriter &&other) noexcept = default;
+
+    PinnedHostTaskBuffer::~PinnedHostTaskBuffer()
+    {
+        release();
+    }
+
+    PinnedHostTaskBuffer::PinnedHostTaskBuffer(PinnedHostTaskBuffer &&other) noexcept
+    {
+        move_from(std::move(other));
+    }
+
+    PinnedHostTaskBuffer &PinnedHostTaskBuffer::operator=(PinnedHostTaskBuffer &&other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            move_from(std::move(other));
+        }
+        return *this;
+    }
+
+    void PinnedHostTaskBuffer::reserve(std::size_t input_bytes, std::size_t workspace_bytes)
+    {
+        const std::size_t required_bytes = checked_add(input_bytes, workspace_bytes);
+        if (required_bytes > capacity_bytes_)
+        {
+            const std::size_t new_capacity = grow_capacity(capacity_bytes_, required_bytes);
+            void *new_data = nullptr;
+            const cudaError_t status = ::cudaMallocHost(&new_data, new_capacity);
+            if (status != cudaSuccess)
+            {
+                throw std::runtime_error("cudaMallocHost failed: " +
+                                         std::string(::cudaGetErrorString(status)));
+            }
+
+            release();
+            data_ = static_cast<std::byte *>(new_data);
+            capacity_bytes_ = new_capacity;
+        }
+
+        input_size_bytes_ = input_bytes;
+        workspace_size_bytes_ = workspace_bytes;
+    }
+
+    std::span<std::byte> PinnedHostTaskBuffer::mutable_input_bytes() noexcept
+    {
+        return {data_, input_size_bytes_};
+    }
+
+    std::span<const std::byte> PinnedHostTaskBuffer::input_bytes() const noexcept
+    {
+        return {data_, input_size_bytes_};
+    }
+
+    std::span<std::byte> PinnedHostTaskBuffer::mutable_workspace_bytes() noexcept
+    {
+        return {data_ + input_size_bytes_, workspace_size_bytes_};
+    }
+
+    std::span<const std::byte> PinnedHostTaskBuffer::workspace_bytes() const noexcept
+    {
+        return {data_ + input_size_bytes_, workspace_size_bytes_};
+    }
+
+    std::size_t PinnedHostTaskBuffer::capacity_bytes() const noexcept
+    {
+        return capacity_bytes_;
+    }
+
+    std::size_t PinnedHostTaskBuffer::input_size_bytes() const noexcept
+    {
+        return input_size_bytes_;
+    }
+
+    std::size_t PinnedHostTaskBuffer::workspace_size_bytes() const noexcept
+    {
+        return workspace_size_bytes_;
+    }
+
+    void PinnedHostTaskBuffer::release() noexcept
+    {
+        if (data_ != nullptr)
+        {
+            (void)::cudaFreeHost(data_);
+            data_ = nullptr;
+        }
+        capacity_bytes_ = 0;
+        input_size_bytes_ = 0;
+        workspace_size_bytes_ = 0;
+    }
+
+    void PinnedHostTaskBuffer::move_from(PinnedHostTaskBuffer &&other) noexcept
+    {
+        data_ = std::exchange(other.data_, nullptr);
+        capacity_bytes_ = std::exchange(other.capacity_bytes_, 0);
+        input_size_bytes_ = std::exchange(other.input_size_bytes_, 0);
+        workspace_size_bytes_ = std::exchange(other.workspace_size_bytes_, 0);
+    }
+
+    MatDispatchReader::MatDispatchReader(const std::filesystem::path &path)
+        : input_(path, std::ios::in | std::ios::binary)
+    {
+        if (!input_)
+        {
+            throw std::runtime_error("Failed to open *.mat file for dispatch reading.");
+        }
+    }
+
+    bool MatDispatchReader::read_next(MatDispatchTask &task, std::size_t workspace_bytes)
+    {
+        MatMetaData encoded_meta{};
+        input_.read(reinterpret_cast<char *>(&encoded_meta), checked_to_streamsize(kMatHeaderBytes));
+
+        if (input_.gcount() == 0 && input_.eof())
+        {
+            return false;
+        }
+        if (input_.gcount() != checked_to_streamsize(kMatHeaderBytes))
+        {
+            throw std::runtime_error("Truncated *.mat header while dispatch reading.");
+        }
+
+        const std::uint64_t rows_u64 = from_network_u64(encoded_meta.rows);
+        const std::uint64_t columns_u64 = from_network_u64(encoded_meta.columns);
+        if (rows_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+            columns_u64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        {
+            throw std::overflow_error("Matrix dimensions exceed platform size_t range.");
+        }
+
+        const std::size_t rows = static_cast<std::size_t>(rows_u64);
+        const std::size_t columns = static_cast<std::size_t>(columns_u64);
+        const std::size_t element_count = checked_multiply(rows, columns);
+        const std::size_t payload_bytes = checked_multiply(element_count, kMatElementBytes);
+
+        task.buffer.reserve(payload_bytes, workspace_bytes);
+        if (payload_bytes > 0)
+        {
+            std::span<std::byte> input_bytes = task.buffer.mutable_input_bytes();
+            input_.read(reinterpret_cast<char *>(input_bytes.data()), checked_to_streamsize(payload_bytes));
+            if (input_.gcount() != checked_to_streamsize(payload_bytes))
+            {
+                throw std::runtime_error("Truncated *.mat payload while dispatch reading.");
+            }
+        }
+
+        task.sequence_index = next_sequence_index_;
+        task.rows = rows;
+        task.columns = columns;
+        next_sequence_index_ = checked_add(next_sequence_index_, 1);
+        return true;
+    }
+
+    Matrix decode_dispatch_task_matrix(const MatDispatchTask &task)
+    {
+        Matrix matrix;
+        matrix.rows = task.rows;
+        matrix.columns = task.columns;
+
+        const std::size_t element_count = checked_multiply(matrix.rows, matrix.columns);
+        const std::size_t payload_bytes = checked_multiply(element_count, kMatElementBytes);
+        const std::span<const std::byte> payload = task.buffer.input_bytes();
+        if (payload.size() != payload_bytes)
+        {
+            throw std::invalid_argument("Dispatch payload size does not match rows * columns.");
+        }
+
+        matrix.values.resize(element_count);
+        for (std::size_t index = 0; index < element_count; ++index)
+        {
+            std::uint64_t encoded = 0;
+            std::memcpy(&encoded, payload.data() + checked_multiply(index, kMatElementBytes), kMatElementBytes);
+            matrix.values[index] = decode_network_double(encoded);
+        }
+        return matrix;
+    }
 
     MatFilePolicy::Reader MatFilePolicy::open_reader(const std::filesystem::path &path)
     {
