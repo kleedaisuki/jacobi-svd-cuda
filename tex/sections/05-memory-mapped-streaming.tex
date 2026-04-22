@@ -287,15 +287,17 @@ $64\,\mathrm{KiB}$。因此同一个 \texttt{MatDispatchTask} 可以被读取循
 \paragraph{语义上，派发任务保存的是原始载荷而不是已解码矩阵。}
 \texttt{MatDispatchReader::read\_next} 的状态转移为：
 \[
-    \text{read header}
-    \longrightarrow
-    \text{validate dimensions}
-    \longrightarrow
-    \text{reserve pinned buffer}
-    \longrightarrow
-    \text{read payload bytes}
-    \longrightarrow
-    \text{assign sequence index}.
+    \begin{aligned}
+        \text{read header}
+         & \longrightarrow
+        \text{validate dimensions}
+        \longrightarrow
+        \text{reserve pinned buffer} \\
+         & \longrightarrow
+        \text{read payload bytes}
+        \longrightarrow
+        \text{assign sequence index}.
+    \end{aligned}
 \]
 载荷仍保持磁盘上的网络字节序。若后续阶段需要传统 \texttt{Matrix}，可以调用
 \texttt{decode\_dispatch\_task\_matrix} 完成逐元素解码；若未来 kernel wrapper 支持直接从 pinned staging buffer
@@ -354,8 +356,18 @@ $64\,\mathrm{KiB}$。因此同一个 \texttt{MatDispatchTask} 可以被读取循
 只需要提供满足 concept 的新 policy。这是 C++20 concept 在系统设计中的实际价值：
 它把运行期协议错误提前为编译期接口错误。
 
-\subsection{文本格式：可检查性优先的兼容路径}
+\paragraph{二进制 \texttt{*.mat} policy：吞吐优先的主路径。}
+\texttt{MatFilePolicy} 是这套抽象的“正常路径”。它把前面已经讨论过的内存映射、固定头部、
+网络字节序编码和追加式输出统一封装到
+\texttt{open\_reader} / \texttt{read\_next} / \texttt{open\_writer} / \texttt{write\_next} / \texttt{flush}
+这组接口后面。于是对上层而言，\texttt{*.mat} 只是“一个满足 concept 的 policy”，
+而不是一串散落在控制流里的特殊分支。
 
+这件事的系统意义在于：高性能实现被局部化了。页缓存、映射重建、字节序转换、
+分块编码这些复杂性都留在 \texttt{MatFilePolicy} 内部；\texttt{MatrixInputStream} /
+\texttt{MatrixOutputStream} 仍然只维持一个极小状态机。换句话说，性能优化存在，但它不污染抽象边界。
+
+\paragraph{文本 \texttt{*.txt} policy：可检查性优先的兼容路径。}
 \texttt{TxtFilePolicy} 提供文本矩阵流。其格式约定是：行内元素用空格分隔，行之间用换行分隔，
 矩阵之间用空行分隔。读取器逐行解析：
 
@@ -373,8 +385,9 @@ $64\,\mathrm{KiB}$。因此同一个 \texttt{MatDispatchTask} 可以被读取循
 
 从性能角度看，文本路径显然不是高吞吐路径。它需要执行十进制解析、格式化和更多分支判断。
 但它在系统中仍然有价值：测试样例可读、调试输出可检查、用户可以手写小矩阵输入。
-这是典型的双轨设计：\texttt{*.mat} 面向吞吐与稳定格式，\texttt{*.txt} 面向可观察性
-（observability）与开发便利。
+因此，把它放进 policy 层的意义，不是把文本伪装成“和二进制一样快”，而是让
+\texttt{*.txt} 也通过同一套流接口接入系统。这样，\texttt{*.mat} 面向吞吐与稳定格式，
+\texttt{*.txt} 面向可观察性（observability）与开发便利；二者共享抽象，不共享性能假设。
 
 \subsection{错误模型：在边界处失败，而不是在深处腐化}
 
@@ -385,17 +398,17 @@ $64\,\mathrm{KiB}$。因此同一个 \texttt{MatDispatchTask} 可以被读取循
     \centering
     \begin{tabular}{lll}
         \toprule
-        错误类别   & 检测位置                & 系统含义             \\
+        错误类别        & 检测位置                                   & 系统含义             \\
         \midrule
-        文件打开失败 & 构造 reader / writer  & 外部资源不可用          \\
-        文件长度非法 & 映射前                 & 底层文件状态不满足前置条件    \\
-        头部截断   & \texttt{read\_next} & 记录边界被破坏          \\
-        载荷截断   & \texttt{read\_next} & 元数据与实际字节数不一致     \\
-        维度溢出   & checked arithmetic  & 输入会导致本机地址空间或容器越界 \\
+        文件打开失败      & 构造 reader / writer                     & 外部资源不可用          \\
+        文件长度非法      & 映射前                                    & 底层文件状态不满足前置条件    \\
+        头部截断        & \texttt{read\_next}                    & 记录边界被破坏          \\
+        载荷截断        & \texttt{read\_next}                    & 元数据与实际字节数不一致     \\
+        维度溢出        & checked arithmetic                     & 输入会导致本机地址空间或容器越界 \\
         pinned 分配失败 & \texttt{PinnedHostTaskBuffer::reserve} & 主机侧 staging 资源不足 \\
-        派发载荷截断 & \texttt{MatDispatchReader::read\_next} & 任务边界被破坏，不能进入计算队列 \\
-        行列不一致  & 文本解析                & 文本矩阵不是矩形结构       \\
-        刷新失败   & \texttt{flush}      & 输出持久化状态未知        \\
+        派发载荷截断      & \texttt{MatDispatchReader::read\_next} & 任务边界被破坏，不能进入计算队列 \\
+        行列不一致       & 文本解析                                   & 文本矩阵不是矩形结构       \\
+        刷新失败        & \texttt{flush}                         & 输出持久化状态未知        \\
         \bottomrule
     \end{tabular}
 \end{table}

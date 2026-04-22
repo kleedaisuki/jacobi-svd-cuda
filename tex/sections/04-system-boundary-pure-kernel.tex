@@ -123,7 +123,7 @@ kernel 的尊严来自克制。它不处理世界，它只处理矩阵。
         \texttt{main.cpp}
          & \longrightarrow &
         \texttt{pipeline.cpp}
-         \longrightarrow
+        \longrightarrow
         \{\texttt{io.cu},\texttt{kernels.cu}\}.
     \end{array}
 \]
@@ -333,6 +333,11 @@ kernel launch 或 \texttt{cudaMemcpy} 失败，是运行时系统状态。前者
 
 \subsection{数据结构边界：同名“矩阵”不是同一种东西}
 
+如果只看名字，系统里到处都是“矩阵”；但从实体生命周期（entity lifecycle）的角度看，
+这些“矩阵”根本不是同一种东西。它们有不同的出生位置、不同的合法操作、不同的所有者，
+也有不同的死亡方式。把它们统一叫作 matrix 没问题；把它们当成同一种实体来传递、缓存、
+复用和暴露，就会立刻引入边界污染。
+
 从数据结构角度看，系统里至少存在六种不同层次的“矩阵”：
 
 \begin{itemize}
@@ -344,11 +349,68 @@ kernel launch 或 \texttt{cudaMemcpy} 失败，是运行时系统状态。前者
     \item 输出矩阵：按 \(U\)、\(1\times n\) 的 \(\Sigma\)、\(V\) 三张矩阵写入流。
 \end{itemize}
 
-它们不能混为一谈。文件矩阵适合 I/O 层，派发任务适合 pipeline 的输入边界，
-\texttt{io::Matrix} 适合应用层和测试；\texttt{DeviceMatrix} 适合 kernel wrapper。
+更准确地说，它们对应同一个数值对象在系统里的六个生命阶段：
+\[
+    \begin{gathered}
+        \text{persisted}
+        \rightarrow
+        \text{dispatched}
+        \rightarrow
+        \text{typed on host} \\
+        \rightarrow
+        \text{resident on device}
+        \rightarrow
+        \text{workspace-transformed}
+        \rightarrow
+        \text{materialized as outputs}.
+    \end{gathered}
+\]
+这个视角的重要性在于：\emph{边界不是按“长得像不像矩阵”来切，而是按“此刻它处于哪段生命周期”来切。}
+
+\paragraph{第一段：持久化实体（persisted entity）。}
+文件中的矩阵还不是数值计算对象，而是外部表示（external representation）。
+它的职责是可保存、可传输、可回放，因此它关心的是字节序、记录边界、文件完整性与载荷布局。
+这一阶段的“矩阵”归 I/O 层所有，最典型的操作是 decode，而不是 SVD。
+
+\paragraph{第二段：派发实体（dispatched entity）。}
+当主线程用单游标扫描输入流时，文件中的一段 payload 被包装成带 testcase 序号的任务，
+再附带 pinned host buffer 或延迟解析信息，准备交给 worker。这里的矩阵已经进入系统，
+但它仍然首先是调度对象（scheduling object），不是领域对象。它携带顺序、来源、缓冲区占用
+和背压关系，服务的是 pipeline，而不是 Jacobi 旋转。
+
+\paragraph{第三段：主机侧类型化实体（typed host entity）。}
+\texttt{io::Matrix} 才是第一个真正适合拿来谈“行数、列数、row-major 数组”的矩阵对象。
+到这一步，原始字节已经被解释为类型化数据，应用层和测试代码终于可以在不关心文件格式的前提下
+讨论数值正确性。它适合做边界输入、单元测试和结果比对，但它仍不该承担设备资源管理。
+
+\paragraph{第四段：设备驻留实体（resident device entity）。}
+\texttt{DeviceMatrix} 是计算载体，不是系统通用值对象。它的核心属性不是“也是矩阵”，
+而是“它的存活依赖 CUDA 上下文、分配器和释放时机”。一旦这个对象越过 kernel wrapper
+泄漏到 pipeline，外层就不得不理解 \texttt{cudaMalloc}/\texttt{cudaFree}、同步点和异常路径，
+边界会立刻反向塌陷。
+
+\paragraph{第五段：内部工作实体（workspace entity）。}
+列主序工作区 \texttt{d\_a\_layout} 更进一步，它甚至不是公开语义里的输入或输出矩阵，
+而只是某种执行策略下的中间形态。它为了访存模式（memory access pattern）和布局转置存在，
+生命周期应严格限制在一次 kernel 调用或一次 SVD 计算内部。若这种工作区被提升为公共接口的一部分，
+就等于把“某次优化是否值得启用”错误地升级成“整个系统都必须理解的概念”。
+
+\paragraph{第六段：结果实体（materialized result entity）。}
+输出阶段重新得到的是主机侧可序列化结果：\(U\)、\(\Sigma\)、\(V\) 三者作为数值产物，
+再被编码回输出流。注意这已经不是“输入矩阵的继续存在”，而是一次计算完成后物化
+（materialization）出来的新实体。它们可以被写盘、校验、比较、统计 sweeps，
+但不应再倒流回设备工作区语义。
+
+因此，它们不能混为一谈。文件矩阵适合 I/O 层，派发任务适合 pipeline 的输入边界，
+\texttt{io::Matrix} 适合应用层和测试；\texttt{DeviceMatrix} 适合 kernel wrapper；
 列主序工作区只属于 \texttt{kernels.cu} 内部。若把设备指针暴露给 pipeline，
 应用层就会开始关心 \texttt{cudaFree}；若把文件映射地址暴露给 kernel，
 数值核心就会开始关心平台页缓存。两种方向都是坏味道。
+
+从“微操”角度看，这个 subsection 真正想保护的是一句很朴素的话：\emph{同一份数学对象，
+    在不同生命周期阶段，应当由不同数据结构承载。} 不这样做，后果通常不是抽象上“不优雅”，
+而是非常具体的工程事故：重复拷贝、悬垂指针、异常路径泄漏、测试夹杂平台细节、
+性能优化打穿语义边界，以及外层代码悄悄依赖内部工作区布局。
 
 正确的数据流是逐层降噪：
 \[
@@ -372,7 +434,17 @@ kernel launch 或 \texttt{cudaMemcpy} 失败，是运行时系统状态。前者
     \xrightarrow{\text{worker decode}}
     \texttt{io::Matrix}.
 \]
-复杂性没有消失，但它被放到了可定位的位置。
+如果进一步压缩成生命周期语言，那么它表达的是：
+\[
+    \text{born outside}
+    \rightarrow
+    \text{typed inside}
+    \rightarrow
+    \text{computed privately}
+    \rightarrow
+    \text{published again}.
+\]
+复杂性没有消失，但它被放到了可定位的位置；资源也没有消失，但每种资源只在自己那一段生命里存活。
 
 \subsection{当前实现的边界风险}
 
